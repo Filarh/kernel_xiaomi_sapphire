@@ -186,4 +186,76 @@
 #define PSY_IIO_COOL_TEMP			0x8f
 #define PSY_IIO_WARM_TEMP			0x90
 #define PSY_IIO_FG_RESET_CLOCK			0x92
+
+/* Xiaomi (renumbered after CLO block) */
+/* DS */
+#define PSY_IIO_DS_ROMID                     0x93
+#define PSY_IIO_DS_STATUS                    0x94
+#define PSY_IIO_DS_PAGENUMBER                0x95
+#define PSY_IIO_DS_PAGEDATA                  0x96
+#define PSY_IIO_DS_AUTHEN_RESULT             0x97
+#define PSY_IIO_DS_SESSION_SEED              0x98
+#define PSY_IIO_DS_S_SECRET                  0x99
+#define PSY_IIO_DS_CHALLENGE                 0x9a
+#define PSY_IIO_DS_AUTH_ANON                 0x9b
+#define PSY_IIO_DS_AUTH_BDCONST              0x9c
+#define PSY_IIO_DS_PAGE0_DATA                0x9d
+#define PSY_IIO_DS_PAGE1_DATA                0x9e
+#define PSY_IIO_DS_VERIFY_MODEL_NAME         0x9f
+#define PSY_IIO_DS_CHIP_OK                   0xa0
+#define PSY_IIO_DS_CYCLE_COUNT               0xa1
+#define PSY_IIO_DS_AUTHENTIC                 0xa2
+
+/* nopmi */
+#define PSY_IIO_MTBF_CUR                     0xa3
+
+/* sc8551 charge pump */
+#define PSY_IIO_STATUS                       0xa4
+#define PSY_IIO_PRESENT                      0xa5
+#define PSY_IIO_SC_FAULT_STATUS              0xa6
+#define PSY_IIO_SC_BATTERY_PRESENT           0xa7
+#define PSY_IIO_SC_VBUS_PRESENT              0xa8
+#define PSY_IIO_SC_BATTERY_VOLTAGE           0xa9
+#define PSY_IIO_SC_BATTERY_CURRENT           0xaa
+#define PSY_IIO_SC_BATTERY_TEMPERATURE       0xab
+#define PSY_IIO_SC_BUS_VOLTAGE               0xac
+#define PSY_IIO_SC_BUS_CURRENT               0xad
+#define PSY_IIO_SC_BUS_TEMPERATURE           0xae
+#define PSY_IIO_SC_DIE_TEMPERATURE           0xaf
+#define PSY_IIO_SC_ALARM_STATUS              0xb0
+#define PSY_IIO_SC_VBUS_ERROR_STATUS         0xb1
+#define PSY_IIO_SC_CHIP_VENDOR               0xb2
+
+/* MAIN charge */
+#define PSY_IIO_CHARGE_ENABLED               0xb3
+
+/* sm5602 fg*/
+#define PSY_IIO_SHUTDOWN_DELAY               0xb4
+#define PSY_IIO_SOC_DECIMAL                  0xb5
+#define PSY_IIO_SOC_DECIMAL_RATE             0xb6
+#define PSY_IIO_FASTCHARGE_MODE              0xb7
+#define PSY_IIO_BATTERY_TYPE                 0xb8
+
+
+/*ln8000*/
+#define PSY_IIO_TI_BYPASS_MODE_ENABLED       0xb9
+#define PSY_IIO_TI_SET_BUS_PROTECTION_FOR_QC3 0xba
+#define PSY_IIO_MODEL_NAME                   0xbb
+#define PSY_IIO_TI_REG_STATUS                0xbc
+#define PSY_IIO_HV_CHARGE_ENABLED            0xbd
+#define PSY_IIO_CP_INPUT_CURRENT_LIMIT       0xbe
+
+#define PSY_IIO_DEV_CHIP_ID                  0xbf
+
+#define PSY_IIO_APDO_VOLT                    0xc0
+#define PSY_IIO_APDO_CURR                    0xc1
+
+// for NOPMI
+#define PSY_IIO_CHARGE_IC_TYPE               0xc2
+#define PSY_IIO_FFC_DISABLE                  0xc3
+
+// for sm5602 fg
+#define PSY_IIO_FG_MONITOR_WORK              0xc4
+#define PSY_IIO_BATT_ID                      0xc5
+
 #endif /* __QTI_POWER_SUPPLY_IIO_H__ */
