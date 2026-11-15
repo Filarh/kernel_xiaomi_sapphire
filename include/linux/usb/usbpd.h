@@ -75,6 +75,16 @@ enum plug_orientation {
 	ORIENTATION_CC2,
 };
 
+/* Source capability as reported to Xiaomi charger policy drivers */
+struct usbpd_pdo {
+	bool pps;
+	int type;
+	int max_volt_mv;
+	int min_volt_mv;
+	int curr_ma;
+	int pos;
+};
+
 #if IS_ENABLED(CONFIG_USB_PD_POLICY)
 /*
  * Obtains an instance of usbpd from a DT phandle
