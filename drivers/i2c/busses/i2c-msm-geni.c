@@ -267,9 +267,10 @@ struct geni_i2c_clk_fld {
 };
 
 static struct geni_i2c_clk_fld geni_i2c_clk_map[] = {
-	{KHz(100), 7, 10, 12, 26},
-	{KHz(400), 2,  5, 11, 22},
-	{KHz(1000), 1, 2,  8, 18},
+	/* sapphire: Xiaomi SCL timings (from stock) */
+	{KHz(100), 7, 10, 11, 26},
+	{KHz(400), 2,  7, 10, 24},
+	{KHz(1000), 1, 3,  9, 18},
 };
 
 static int geni_i2c_clk_map_idx(struct geni_i2c_dev *gi2c)
