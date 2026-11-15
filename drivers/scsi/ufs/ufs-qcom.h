@@ -496,6 +496,64 @@ struct ufs_qcom_regs {
 	size_t len;
 };
 
+
+/*
+ * Xiaomi UFS diagnostics (sapphire): UIC error counters kept in
+ * ufs_qcom_host right after dev_req_params, and the error-state record
+ * returned by get_ufs_data(). Read by the Xiaomi mi_memory module.
+ */
+#define UFS_QCOM_XIAOMI_STATS	1
+
+enum ufshcd_ec_pa {
+	UFS_EC_PA_LANE_0,
+	UFS_EC_PA_LANE_1,
+	UFS_EC_PA_LANE_2,
+	UFS_EC_PA_LANE_3,
+	UFS_EC_PA_LINE_RESET,
+	UFS_EC_PA_MAX,
+};
+
+enum ufshcd_ec_dl {
+	UFS_EC_DL_NAC_RECEIVED,
+	UFS_EC_DL_TCx_REPLAY_TIMER_EXPIRED,
+	UFS_EC_DL_AFCx_REQUEST_TIMER_EXPIRED,
+	UFS_EC_DL_FCx_PROTECT_TIMER_EXPIRED,
+	UFS_EC_DL_CRC_ERROR,
+	UFS_EC_DL_RX_BUFFER_OVERFLOW,
+	UFS_EC_DL_MAX_FRAME_LENGTH_EXCEEDED,
+	UFS_EC_DL_WRONG_SEQUENCE_NUMBER,
+	UFS_EC_DL_AFC_FRAME_SYNTAX_ERROR,
+	UFS_EC_DL_NAC_FRAME_SYNTAX_ERROR,
+	UFS_EC_DL_EOF_SYNTAX_ERROR,
+	UFS_EC_DL_FRAME_SYNTAX_ERROR,
+	UFS_EC_DL_BAD_CTRL_SYMBOL_TYPE,
+	UFS_EC_DL_PA_INIT_ERROR,
+	UFS_EC_DL_PA_ERROR_IND_RECEIVED,
+	UFS_EC_DL_MAX,
+};
+
+struct ufs_uic_stats {
+	u32 pa_err_cnt_total;
+	u32 pa_err_cnt[UFS_EC_PA_MAX];
+	u32 dl_err_cnt_total;
+	u32 dl_err_cnt[UFS_EC_DL_MAX];
+	u32 dme_err_cnt;
+};
+
+#define UFS_ERR_REASON_MAX	10
+#define UFS_ERR_REASON_LEN	32
+
+struct UFS_ERR_STATE_DEBUG {
+	u64 err_occurred;
+	char err_reason[UFS_ERR_REASON_MAX][UFS_ERR_REASON_LEN];
+};
+
+struct UFS_DATA {
+	struct UFS_ERR_STATE_DEBUG ufs_err_state;
+};
+
+struct UFS_DATA *get_ufs_data(void);
+
 struct ufs_qcom_host {
 	/*
 	 * Set this capability if host controller supports the QUniPro mode
@@ -532,6 +590,8 @@ struct ufs_qcom_host {
 	struct ufs_hba *hba;
 	struct ufs_qcom_bus_vote bus_vote;
 	struct ufs_pa_layer_attr dev_req_params;
+	/* Xiaomi: must stay right after dev_req_params (read by mi_memory) */
+	struct ufs_uic_stats ufs_stats;
 	struct clk *rx_l0_sync_clk;
 	struct clk *tx_l0_sync_clk;
 	struct clk *rx_l1_sync_clk;

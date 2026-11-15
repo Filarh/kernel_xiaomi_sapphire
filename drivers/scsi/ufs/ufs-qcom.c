@@ -4498,6 +4498,67 @@ static void ufs_qcom_save_all_regs(struct ufs_qcom_host *host)
 
 }
 
+/* Xiaomi UFS diagnostics (sapphire) */
+static struct UFS_DATA ufs_data;
+static DEFINE_SPINLOCK(ufs_data_lock);
+
+struct UFS_DATA *get_ufs_data(void)
+{
+	return &ufs_data;
+}
+EXPORT_SYMBOL(get_ufs_data);
+
+static void ufs_qcom_xiaomi_set_err_state(const char *reason)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&ufs_data_lock, flags);
+	i = ufs_data.ufs_err_state.err_occurred % UFS_ERR_REASON_MAX;
+	strscpy(ufs_data.ufs_err_state.err_reason[i], reason, UFS_ERR_REASON_LEN);
+	ufs_data.ufs_err_state.err_occurred++;
+	spin_unlock_irqrestore(&ufs_data_lock, flags);
+}
+
+static void ufs_qcom_xiaomi_count_uic_err(struct ufs_qcom_host *host,
+					  enum ufs_event_type evt, u32 reg)
+{
+	struct ufs_uic_stats *st = &host->ufs_stats;
+	int i;
+
+	switch (evt) {
+	case UFS_EVT_PA_ERR:
+		st->pa_err_cnt_total++;
+		for (i = 0; i < UFS_EC_PA_MAX; i++)
+			if (reg & BIT(i))
+				st->pa_err_cnt[i]++;
+		ufs_qcom_xiaomi_set_err_state("pa_err");
+		break;
+	case UFS_EVT_DL_ERR:
+		st->dl_err_cnt_total++;
+		for (i = 0; i < UFS_EC_DL_MAX; i++)
+			if (reg & BIT(i))
+				st->dl_err_cnt[i]++;
+		ufs_qcom_xiaomi_set_err_state("dl_err");
+		break;
+	case UFS_EVT_DME_ERR:
+		st->dme_err_cnt++;
+		ufs_qcom_xiaomi_set_err_state("dme_err");
+		break;
+	case UFS_EVT_FATAL_ERR:
+		ufs_qcom_xiaomi_set_err_state("fatal_err");
+		break;
+	case UFS_EVT_LINK_STARTUP_FAIL:
+		ufs_qcom_xiaomi_set_err_state("link_startup_fail");
+		break;
+	case UFS_EVT_ABORT:
+		ufs_qcom_xiaomi_set_err_state("abort");
+		break;
+	default:
+		break;
+	}
+}
+
 static void ufs_qcom_event_notify(struct ufs_hba *hba,
 								  enum ufs_event_type evt,
 								  void *data)
@@ -4538,6 +4599,8 @@ static void ufs_qcom_event_notify(struct ufs_hba *hba,
 
 	if (evt_valid)
 		host->valid_evt_cnt[evt]++;
+
+	ufs_qcom_xiaomi_count_uic_err(host, evt, reg);
 }
 
 void ufs_qcom_print_hw_debug_reg_all(struct ufs_hba *hba,
