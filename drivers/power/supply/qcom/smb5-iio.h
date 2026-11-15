@@ -15,6 +15,8 @@ enum iio_type {
 	QG,
 	CP,
 	SMB_PARALLEL,
+	AUTH_BATT,
+	THIRD_CP,
 };
 
 /* For qpnp-smb5.c and smb5-lib.c */
@@ -28,16 +30,46 @@ enum qg_chg_iio_channels {
 	SMB5_QG_VOLTAGE_MAX,
 	SMB5_QG_CHARGE_FULL,
 	SMB5_QG_RESISTANCE_ID,
+	SMB5_QG_FASTCHARGE_MODE,
 	SMB5_QG_TEMP,
 	SMB5_QG_CHARGE_COUNTER,
 	SMB5_QG_CYCLE_COUNT,
 	SMB5_QG_CHARGE_FULL_DESIGN,
 	SMB5_QG_TIME_TO_FULL_NOW,
+	SMB5_QG_FFC_CHG_TERMINATION_CURRENT,
 	SMB5_QG_TIME_TO_EMPTY_NOW,
 	SMB5_QG_NOMINAL_CAPACITY,
 	SMB5_QG_LEARNED_CAPACITY,
 	SMB5_QG_SOH,
 	SMB5_QG_MAX,
+	SMB5_QG_SOC_DECIMAL,
+	SMB5_QG_SOC_DECIMAL_RATE,
+	SMB5_QG_SHUTDOWN_DELAY,
+	SMB5_QG_BATT_FULL_CURRENT,
+};
+
+/* Xiaomi: battery authentication (auth_battery) channels */
+enum auth_iio_channels {
+	AUTH_BATTERY_ID,
+	AUTH_CHIP_OK,
+	AUTH_SECRET_MANUFACTURER,
+	AUTH_BATT_MANUFACTURER,
+	AUTH_AUTHENTIC,
+};
+
+/* Xiaomi: third-party charge pump (sc8541 / bq25960) channels */
+enum third_cp_iio_channels {
+	THIRD_CP_SC_BUS_CURRENT,
+	THIRD_CP_SC_MANUFACTURER,
+	THIRD_CP_BQ_BUS_CURRENT = 3,
+	THIRD_CP_BQ_MANUFACTURER,
+	SMB5_THIRD_CP_SET_ACDRV,
+};
+
+enum master_cp_vd {
+	THIRD_CP_NONE,
+	THIRD_CP_SC,
+	THIRD_CP_BQ,
 };
 
 enum cp_iio_channels {
@@ -210,6 +242,17 @@ static const struct smb5_iio_prop_channels smb5_chans_pmic[] = {
 	SMB5_CHAN_ACTIVITY("battery_fcc_stepper_enable", FCC_STEPPER_ENABLE)
 	SMB5_CHAN_INDEX("usb_typec_accessory_mode", TYPEC_ACCESSORY_MODE)
 	SMB5_CHAN_ACTIVITY("battery_sys_soc", SYS_SOC)
+	/* Xiaomi */
+	SMB5_CHAN_ACTIVITY("input_suspend", INPUT_SUSPEND)
+	SMB5_CHAN_VOLT("apdo_volt", APDO_VOLT)
+	SMB5_CHAN_CUR("apdo_curr", APDO_CURR)
+	SMB5_CHAN_ACTIVITY("cp_input_suspend", CP_INPUT_SUSPEND)
+	SMB5_CHAN_ACTIVITY("battery_charging_enabled", BATTERY_CHARGING_ENABLED)
+	SMB5_CHAN_ACTIVITY("battery_charging_limited", BATTERY_CHARGING_LIMITED)
+	SMB5_CHAN_INDEX("quick_charge_type", QUICK_CHARGE_TYPE)
+	SMB5_CHAN_ACTIVITY("sm_fastcharge_mode", SM_FASTCHARGE_MODE)
+	SMB5_CHAN_ACTIVITY("recharg_mode", RECHARGE_MODE)
+	SMB5_CHAN_INDEX("hvdcp3_type", HVDCP3_TYPE)
 };
 
 struct iio_channel **get_ext_channels(struct device *dev,

@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/pmic-voter.h>
 #include <linux/iio/consumer.h>
+#include <linux/qti_power_supply.h>
 #include <dt-bindings/iio/qti_power_supply_iio.h>
 #include "step-chg-jeita.h"
 #include "battery-profile-loader.h"
@@ -25,11 +26,12 @@
 #define JEITA_VOTER		"JEITA_VOTER"
 #define JEITA_FCC_SCALE_VOTER	"JEITA_FCC_SCALE_VOTER"
 
+/* Xiaomi: the upper bound of an ascending range is exclusive */
 #define is_between(left, right, value) \
 		(((left) >= (right) && (left) >= (value) \
 			&& (value) >= (right)) \
 		|| ((left) <= (right) && (left) <= (value) \
-			&& (value) <= (right)))
+			&& (value) < (right)))
 
 struct step_chg_cfg {
 	struct step_chg_jeita_param	param;
@@ -62,6 +64,7 @@ struct step_chg_info {
 	bool			batt_missing;
 	bool			taper_fcc;
 	bool			jeita_fcc_scaling;
+	int			chg_term_current;
 	bool			fg_remote;
 	int			jeita_fcc_index;
 	int			jeita_fv_index;
@@ -83,6 +86,7 @@ struct step_chg_info {
 	struct power_supply	*batt_psy;
 	struct power_supply	*usb_psy;
 	struct power_supply	*dc_psy;
+	struct power_supply	*batt_verify_psy;
 	struct delayed_work	status_change_work;
 	struct delayed_work	get_config_work;
 	struct notifier_block	nb;
@@ -91,6 +95,19 @@ struct step_chg_info {
 };
 
 static struct step_chg_info *the_chip;
+
+/* Xiaomi: battery-ageing step charging tables, selected by cycle count */
+struct range_data step1_chg_ranges[MAX_STEP_CHG_ENTRIES] = {
+	{3600000, 4220000, 6000000},
+	{4220000, 4460000, 5400000},
+	{4460001, 4490000, 3936000},
+};
+
+struct range_data step2_chg_ranges[MAX_STEP_CHG_ENTRIES] = {
+	{3600000, 4220000, 4800000},
+	{4220000, 4460000, 4320000},
+	{4460000, 4470000, 3148800},
+};
 
 #define STEP_CHG_HYSTERISIS_DELAY_US		5000000 /* 5 secs */
 
@@ -324,6 +341,27 @@ static int step_chg_read_iio_prop(struct step_chg_info *chip,
 	}
 
 	rc = iio_read_channel_processed(iio_chan_list, val);
+	return (rc < 0) ? rc : 0;
+}
+
+static int step_chg_write_iio_prop(struct step_chg_info *chip,
+		enum iio_type type, int iio_chan, int val)
+{
+	struct iio_channel *iio_chan_list;
+	int rc;
+
+	switch (type) {
+	case MAIN:
+		if (!chip->iio_chans)
+			return -ENODEV;
+		iio_chan_list = &chip->iio_chans[iio_chan];
+		break;
+	default:
+		pr_err_ratelimited("iio_type %d is not supported\n", type);
+		return -EINVAL;
+	}
+
+	rc = iio_write_channel_raw(iio_chan_list, val);
 	return (rc < 0) ? rc : 0;
 }
 
@@ -568,6 +606,7 @@ reschedule:
 
 }
 
+#define JEITA_HYS_SPLIT_INDEX	5
 static int get_val(struct range_data *range, int rise_hys, int fall_hys,
 		int current_index, int threshold, int *new_index, int *val)
 {
@@ -626,7 +665,12 @@ static int get_val(struct range_data *range, int rise_hys, int fall_hys,
 	 * Check for hysteresis if it in the neighbourhood
 	 * of our current index.
 	 */
-	if (*new_index == current_index + 1) {
+	/*
+	 * Xiaomi: rise hysteresis only applies below index 5 and fall
+	 * hysteresis only from index 5 upwards.
+	 */
+	if (*new_index == current_index + 1 &&
+			*new_index < JEITA_HYS_SPLIT_INDEX) {
 		if (threshold <
 			(range[*new_index].low_threshold + rise_hys)) {
 			/*
@@ -636,7 +680,8 @@ static int get_val(struct range_data *range, int rise_hys, int fall_hys,
 			*new_index = current_index;
 			*val = range[current_index].value;
 		}
-	} else if (*new_index == current_index - 1) {
+	} else if (*new_index == current_index - 1 &&
+			*new_index >= JEITA_HYS_SPLIT_INDEX) {
 		if (threshold >
 			range[*new_index].high_threshold - fall_hys) {
 			/*
@@ -693,6 +738,8 @@ static void taper_fcc_step_chg(struct step_chg_info *chip, int index,
 	}
 }
 
+/* Xiaomi: ignore implausible step charging readings (> 5V) */
+#define STEP_CHG_MAX_VALID_VAL		5000000
 static int handle_step_chg_config(struct step_chg_info *chip)
 {
 	union power_supply_propval pval = {0, };
@@ -721,9 +768,10 @@ static int handle_step_chg_config(struct step_chg_info *chip)
 				chip->step_chg_config->param.psy_prop, &pval);
 	}
 
-	if (rc < 0) {
-		pr_err("Couldn't read %s property rc=%d\n",
-			chip->step_chg_config->param.prop_name, rc);
+	if (rc < 0 || pval.intval > STEP_CHG_MAX_VALID_VAL) {
+		pr_err("Couldn't read %s property rc=%d val=%d\n",
+			chip->step_chg_config->param.prop_name, rc,
+			pval.intval);
 		return rc;
 	}
 
@@ -762,7 +810,7 @@ static int handle_step_chg_config(struct step_chg_info *chip)
 		vote(chip->fcc_votable, STEP_CHG_VOTER, true, fcc_ua);
 	}
 
-	pr_debug("%s = %d Step-FCC = %duA taper-fcc: %d\n",
+	pr_info("%s = %d Step-FCC = %duA taper-fcc: %d\n",
 		chip->step_chg_config->param.prop_name, pval.intval,
 		get_client_vote(chip->fcc_votable, STEP_CHG_VOTER),
 		chip->taper_fcc);
@@ -847,10 +895,30 @@ static void handle_jeita_fcc_scaling(struct step_chg_info *chip)
 }
 
 #define JEITA_SUSPEND_HYST_UV		50000
+
+/* Xiaomi FFC (fast charge mode) / recharge handling, values from stock */
+#define BATT_VERIFED_VOTER		"BATT_VERIFED_VOTER"
+#define BATT_UNVERIFIED_FCC_UA		3600000
+#define JEITA_HOT_INDEX			7
+#define FFC_MAX_SOC			94
+#define FFC_TEMP_MIN			151
+#define FFC_TEMP_MAX			479
+#define FFC_TEMP_ENABLE_MIN		150
+#define FFC_TEMP_ENABLE_MAX		480
+#define FFC_ITERM_WARM_MA		-750
+#define FFC_ITERM_HOT_MA		-1000
+#define FFC_ITERM_HOT_MA_1		-1100
+#define NON_FFC_ITERM_MA		-250
+#define RECHG_TEMP_MIN			150
+#define RECHG_TEMP_MAX			480
+
 static int handle_jeita(struct step_chg_info *chip)
 {
 	union power_supply_propval pval = {0, };
 	int rc = 0, fcc_ua = 0, fv_uv = 0, data;
+	int temp, last_fcc_index, pd_active, batt_soc, batt_authentic;
+	int fastcharge_mode, iterm;
+	bool fcm;
 	u64 elapsed_us;
 
 	rc = step_chg_read_iio_prop(chip, MAIN, PSY_IIO_SW_JEITA_ENABLED,
@@ -898,6 +966,8 @@ static int handle_jeita(struct step_chg_info *chip)
 		return rc;
 	}
 
+	temp = pval.intval;
+	last_fcc_index = chip->jeita_fcc_index;
 	rc = get_val(chip->jeita_fcc_config->fcc_cfg,
 			chip->jeita_fcc_config->param.rise_hys,
 			chip->jeita_fcc_config->param.fall_hys,
@@ -935,6 +1005,167 @@ static int handle_jeita(struct step_chg_info *chip)
 
 	if (!chip->usb_icl_votable)
 		goto set_jeita_fv;
+
+	/*
+	 * Xiaomi: once charging has been stopped at the hot (index 7) or cold
+	 * (out of range) end, keep it stopped until the temperature is back
+	 * by the fall hysteresis.
+	 */
+	if (last_fcc_index == JEITA_HOT_INDEX) {
+		if (temp >= chip->jeita_fcc_config->fcc_cfg[JEITA_HOT_INDEX - 1].high_threshold
+				- chip->jeita_fcc_config->param.fall_hys) {
+			pr_info("Battery Temperature(%d) between %d and %d,not allow charging yet!!\n",
+				temp,
+				chip->jeita_fcc_config->fcc_cfg[JEITA_HOT_INDEX - 1].high_threshold,
+				chip->jeita_fcc_config->fcc_cfg[JEITA_HOT_INDEX - 1].high_threshold
+				- chip->jeita_fcc_config->param.fall_hys);
+			chip->jeita_fcc_index = JEITA_HOT_INDEX;
+			chip->jeita_fv_index = JEITA_HOT_INDEX;
+			vote(chip->fcc_votable, JEITA_VOTER, true, 0);
+		}
+	} else if (last_fcc_index == -EINVAL) {
+		if (temp <= chip->jeita_fcc_config->param.fall_hys
+				+ chip->jeita_fcc_config->fcc_cfg[0].low_threshold) {
+			pr_info("Battery Temperature(%d) between %d and %d,not allow charging yet!!\n",
+				temp,
+				chip->jeita_fcc_config->fcc_cfg[0].low_threshold,
+				chip->jeita_fcc_config->param.fall_hys
+				+ chip->jeita_fcc_config->fcc_cfg[0].low_threshold);
+			chip->jeita_fcc_index = -EINVAL;
+			chip->jeita_fv_index = -EINVAL;
+			vote(chip->fcc_votable, JEITA_VOTER, true, 0);
+		}
+	}
+
+	rc = step_chg_read_iio_prop(chip, MAIN, PSY_IIO_PD_ACTIVE, &pval.intval);
+	if (rc < 0)
+		pr_err("Get fastcharge mode status failed, rc=%d\n", rc);
+	pd_active = pval.intval;
+
+	rc = power_supply_get_property(chip->batt_psy,
+				POWER_SUPPLY_PROP_CAPACITY, &pval);
+	if (rc < 0) {
+		pr_err("Couldn't read batt_soc fail rc=%d\n", rc);
+		return rc;
+	}
+	batt_soc = pval.intval;
+	if (batt_soc > FFC_MAX_SOC)
+		pr_err("soc:%d is more than 95, do not set fastcharge mode\n",
+			batt_soc);
+
+	if (!chip->batt_verify_psy)
+		chip->batt_verify_psy = power_supply_get_by_name("batt_verify");
+	if (chip->batt_verify_psy) {
+		rc = power_supply_get_property(chip->batt_verify_psy,
+				POWER_SUPPLY_PROP_ONLINE, &pval);
+		if (rc < 0)
+			pr_err("qg_load_battery_profile : get batt id error\n");
+		rc = power_supply_get_property(chip->batt_verify_psy,
+				POWER_SUPPLY_PROP_AUTHENTIC, &pval);
+	}
+	batt_authentic = pval.intval;
+	if (rc < 0 || !pval.intval || !chip->batt_verify_psy) {
+		pr_err("batt authentic fail, limit charging current\n");
+		vote(chip->fcc_votable, BATT_VERIFED_VOTER, true,
+			BATT_UNVERIFIED_FCC_UA);
+	} else {
+		vote(chip->fcc_votable, BATT_VERIFED_VOTER, false, 0);
+	}
+
+	rc = step_chg_read_iio_prop(chip, MAIN, PSY_IIO_SM_FASTCHARGE_MODE,
+			&pval.intval);
+	if (rc < 0) {
+		pr_err("Couldn't read fastcharge mode fail rc=%d\n", rc);
+		return rc;
+	}
+	fastcharge_mode = pval.intval;
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT, &pval);
+	if (rc < 0)
+		pr_err("Couldn't get chg_term_current, rc=%d\n", rc);
+
+	if (fastcharge_mode) {
+		if (chip->jeita_fcc_index == 4)
+			iterm = FFC_ITERM_WARM_MA;
+		else if (chip->jeita_fcc_index == 5)
+			iterm = (batt_authentic == 1) ? FFC_ITERM_HOT_MA_1 :
+						FFC_ITERM_HOT_MA;
+		else
+			iterm = 0;
+
+		if (iterm != pval.intval) {
+			pval.intval = iterm;
+			rc = power_supply_set_property(chip->batt_psy,
+				POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT, &pval);
+			if (rc < 0)
+				pr_err("Couldn't set chg_term_current, rc=%d\n",
+					rc);
+			pr_err("batt_temp = %d, ffc_chg_term_current=%d\n",
+				temp, iterm);
+		}
+
+		fcm = true;
+		if (pd_active != QTI_POWER_SUPPLY_PD_PPS_ACTIVE ||
+				temp < FFC_TEMP_MIN || temp > FFC_TEMP_MAX) {
+			if (pd_active == QTI_POWER_SUPPLY_PD_PPS_ACTIVE)
+				pr_err("temp:%d disable fastcharge mode\n",
+					temp);
+			rc = step_chg_write_iio_prop(chip, MAIN,
+					PSY_IIO_SM_FASTCHARGE_MODE, 0);
+			if (rc < 0) {
+				pr_err("Set fastcharge mode failed, rc=%d\n",
+					rc);
+				return rc;
+			}
+			if (pd_active != QTI_POWER_SUPPLY_PD_PPS_ACTIVE)
+				pr_err("disable fastcharge mode\n");
+			fcm = false;
+		}
+	} else {
+		iterm = pval.intval;
+		fcm = false;
+		if (pd_active == QTI_POWER_SUPPLY_PD_PPS_ACTIVE &&
+			temp < FFC_TEMP_ENABLE_MAX -
+				chip->jeita_fv_config->param.fall_hys &&
+			temp > chip->jeita_fv_config->param.rise_hys +
+				FFC_TEMP_ENABLE_MIN &&
+			batt_soc <= FFC_MAX_SOC) {
+			pr_err("temp:%d enable fastcharge mode\n", temp);
+			rc = step_chg_write_iio_prop(chip, MAIN,
+					PSY_IIO_SM_FASTCHARGE_MODE, 1);
+			if (rc < 0) {
+				pr_err("Set fastcharge mode failed, rc=%d\n",
+					rc);
+				return rc;
+			}
+			pval.intval = NON_FFC_ITERM_MA;
+			rc = power_supply_set_property(chip->batt_psy,
+				POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT, &pval);
+			if (rc < 0)
+				pr_err("Couldn't set chg_term_current, rc=%d\n",
+					rc);
+			iterm = NON_FFC_ITERM_MA;
+			pr_info("maintain non ffc charging iterm, aviod discharging early\n");
+		}
+	}
+
+	pr_info("temp = %d, FCM = %d, fcc_ua(%d) = %d, fv_uv(%d) = %d, iterm = %d\n",
+		temp, fcm, chip->jeita_fcc_index, fcc_ua,
+		chip->jeita_fv_index, fv_uv, iterm);
+
+	/* Xiaomi: allow recharge only within the normal temperature range */
+	rc = step_chg_write_iio_prop(chip, MAIN, PSY_IIO_RECHARGE_MODE,
+			(temp >= RECHG_TEMP_MIN && temp <= RECHG_TEMP_MAX) ? 1 : 0);
+	if (rc < 0) {
+		pr_err("Set recharge mode failed, rc=%d\n", rc);
+		return rc;
+	}
+
+	rc = step_chg_read_iio_prop(chip, MAIN, PSY_IIO_RECHARGE_MODE,
+			&pval.intval);
+	if (rc < 0)
+		pr_err("Couldn't read recharge mode fail rc=%d\n", rc);
 
 	/*
 	 * If JEITA float voltage is same as max-vfloat of battery then
@@ -1002,6 +1233,74 @@ static int handle_battery_insertion(struct step_chg_info *chip)
 	return rc;
 }
 
+/*
+ * Xiaomi: pick the step charging table and the JEITA normal-temperature
+ * FCC/FV (entries 4 and 5) from the battery cycle count and FFC state.
+ */
+#define STEP_CHG_CYCLE_FRESH		100
+#define STEP_CHG_CYCLE_FV_DROP		300
+#define STEP_CHG_CYCLE_AGED		800
+static int handle_step_chg_cycle_count(struct step_chg_info *chip)
+{
+	union power_supply_propval pval = {0, };
+	int rc, fastcharge_mode = 0, fcc_ua, fv_uv;
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CYCLE_COUNT, &pval);
+	if (rc < 0) {
+		pr_err("cycle_count is not ready fail rc = %d\n", rc);
+		return rc;
+	}
+	pr_info("step: cycle_count is %d\n", pval.intval);
+
+	rc = step_chg_read_iio_prop(chip, MAIN, PSY_IIO_SM_FASTCHARGE_MODE,
+			&fastcharge_mode);
+	if (rc < 0) {
+		pr_err("Couldn't read fastcharge mode fail rc=%d\n", rc);
+		return rc;
+	}
+
+	if (pval.intval <= STEP_CHG_CYCLE_FRESH) {
+		if (fastcharge_mode) {
+			fcc_ua = 6000000;
+			fv_uv = 4500000;
+		} else {
+			fcc_ua = 5400000;
+			fv_uv = 4450000;
+		}
+	} else if (pval.intval <= STEP_CHG_CYCLE_AGED) {
+		memcpy(chip->step_chg_config->fcc_cfg, step1_chg_ranges,
+			sizeof(step1_chg_ranges));
+		if (fastcharge_mode) {
+			fcc_ua = 6000000;
+			fv_uv = 4480000;
+		} else {
+			fcc_ua = 5400000;
+			if (pval.intval <= STEP_CHG_CYCLE_FV_DROP)
+				fv_uv = 4440000;
+			else
+				fv_uv = 4430000;
+		}
+	} else {
+		memcpy(chip->step_chg_config->fcc_cfg, step2_chg_ranges,
+			sizeof(step2_chg_ranges));
+		if (fastcharge_mode) {
+			fcc_ua = 4800000;
+			fv_uv = 4460000;
+		} else {
+			fcc_ua = 4320000;
+			fv_uv = 4410000;
+		}
+	}
+
+	chip->jeita_fcc_config->fcc_cfg[4].value = fcc_ua;
+	chip->jeita_fv_config->fv_cfg[4].value = fv_uv;
+	chip->jeita_fcc_config->fcc_cfg[5].value = fcc_ua;
+	chip->jeita_fv_config->fv_cfg[5].value = fv_uv;
+
+	return 0;
+}
+
 static void status_change_work(struct work_struct *work)
 {
 	struct step_chg_info *chip = container_of(work,
@@ -1013,6 +1312,10 @@ static void status_change_work(struct work_struct *work)
 		goto exit_work;
 
 	handle_battery_insertion(chip);
+
+	rc = handle_step_chg_cycle_count(chip);
+	if (rc < 0)
+		pr_err("Couldn't handle step cycle count rc = %d\n", rc);
 
 	/* skip elapsed_us debounce for handling battery temperature */
 	rc = handle_jeita(chip);
@@ -1127,12 +1430,12 @@ int qcom_step_chg_init(struct device *dev, bool step_chg_enable,
 	chip->jeita_fcc_config->param.iio_prop = STEP_QG_TEMP;
 	chip->jeita_fcc_config->param.prop_name = "BATT_TEMP";
 	chip->jeita_fcc_config->param.rise_hys = 10;
-	chip->jeita_fcc_config->param.fall_hys = 10;
+	chip->jeita_fcc_config->param.fall_hys = 20;
 	chip->jeita_fv_config->param.psy_prop = POWER_SUPPLY_PROP_TEMP;
 	chip->jeita_fv_config->param.iio_prop = STEP_QG_TEMP;
 	chip->jeita_fv_config->param.prop_name = "BATT_TEMP";
 	chip->jeita_fv_config->param.rise_hys = 10;
-	chip->jeita_fv_config->param.fall_hys = 10;
+	chip->jeita_fv_config->param.fall_hys = 20;
 
 	INIT_DELAYED_WORK(&chip->status_change_work, status_change_work);
 	INIT_DELAYED_WORK(&chip->get_config_work, get_config_work);

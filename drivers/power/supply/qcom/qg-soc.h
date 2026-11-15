@@ -12,6 +12,10 @@ int qg_soc_init(struct qpnp_qg *chip);
 void qg_soc_exit(struct qpnp_qg *chip);
 int qg_adjust_sys_soc(struct qpnp_qg *chip);
 
+/* qpnp-qg.c (Xiaomi) */
+int qg_get_ffc_iterm_for_qg(struct qpnp_qg *chip);
+int qg_get_prop_shutdown_delay(struct qpnp_qg *chip, int *val);
+
 extern struct device_attribute dev_attr_soc_interval_ms;
 extern struct device_attribute dev_attr_soc_cold_interval_ms;
 extern struct device_attribute dev_attr_maint_soc_update_ms;

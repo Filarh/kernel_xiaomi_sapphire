@@ -81,6 +81,28 @@ struct qg_dt {
 	bool			multi_profile_load;
 	bool			tcss_enable;
 	bool			bass_enable;
+	int			*dec_rate_seq;
+	int			dec_rate_len;
+};
+
+#define BATT_MA_AVG_SAMPLES	8
+/* Xiaomi reported-SOC smoothing state (soc_monitor_work) */
+struct batt_params {
+	bool			update_now;
+	int			batt_raw_soc;
+	int			batt_soc;
+	int			samples_num;
+	int			samples_index;
+	int			batt_ma_avg_samples[BATT_MA_AVG_SAMPLES];
+	int			batt_ma_avg;
+	int			batt_ma_prev;
+	int			batt_ma;
+	int			batt_mv;
+	int			batt_temp;
+	int			batt_rmc;
+	int			batt_volt;
+	int			batt_curr;
+	ktime_t			last_soc_change_time;
 };
 
 struct qg_esr_data {
@@ -108,6 +130,8 @@ struct qpnp_qg {
 	struct device_node      *batt_node;
 	struct dentry		*dfs_root;
 	dev_t			dev_no;
+	struct batt_params	param;
+	struct delayed_work	soc_monitor_work;
 	struct work_struct	udata_work;
 	struct work_struct	scale_soc_work;
 	struct work_struct	qg_status_change_work;
@@ -134,6 +158,7 @@ struct qpnp_qg {
 	struct power_supply	*dc_psy;
 	struct power_supply	*parallel_psy;
 	struct power_supply	*cp_psy;
+	struct power_supply	*batt_verify_psy;
 	struct qg_esr_data	esr_data[QG_MAX_ESR_COUNT];
 
 	/* status variable */
@@ -156,6 +181,9 @@ struct qpnp_qg {
 	bool			tcss_active;
 	bool			bass_active;
 	bool			first_profile_load;
+	bool			fastcharge_mode_enabled;
+	bool			keep_ffc_iterm;
+	bool			nvt_profile;
 	int			charge_status;
 	int			charge_type;
 	int			chg_iterm_ma;
@@ -191,6 +219,7 @@ struct qpnp_qg {
 	unsigned long		suspend_time;
 	struct iio_channel	*batt_therm_chan;
 	struct iio_channel	*batt_id_chan;
+	struct iio_channel	**iio_chan_list_third_cp;
 
 	/* soc params */
 	int			catch_up_soc;
@@ -216,6 +245,14 @@ struct qpnp_qg {
 	struct cycle_counter	*counter;
 	/* ttf */
 	struct ttf		*ttf;
+	/* Xiaomi */
+	int			*dec_rate_seq;
+	int			dec_rate_len;
+	int			batt_stat;
+	bool			shutdown_delay;
+	bool			shutdown_delay_enable;
+	int			en_delay_soc_zero;
+	struct delayed_work	delay_soc_zero_work;
 };
 
 struct ocv_all {

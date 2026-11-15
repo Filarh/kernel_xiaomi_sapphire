@@ -1813,24 +1813,32 @@ static int qg_get_battery_capacity_real(struct qpnp_qg *chip, int *soc)
 static int qg_get_charge_counter(struct qpnp_qg *chip, int *charge_counter)
 {
 	int rc, cc_soc = 0;
-	int64_t temp = 0;
+	int64_t temp = 0, temp_normal = 0;
 
 	if (is_debug_batt_id(chip) || chip->battery_missing) {
 		*charge_counter = -EINVAL;
 		return 0;
 	}
 
-	rc = qg_get_learned_capacity(chip, &temp);
-	if (rc < 0 || !temp)
-		rc = qg_get_nominal_capacity((int *)&temp, 250, true);
-
+	/* Xiaomi: nominal (25 degC) capacity is always needed for scaling */
+	rc = qg_get_nominal_capacity((int *)&temp_normal, 250, true);
 	if (rc < 0) {
-		pr_err("Failed to get FCC for charge-counter rc=%d\n", rc);
+		pr_err("Failed to get temp_normal for charge-counter rc=%d\n",
+			rc);
 		return rc;
 	}
 
+	rc = qg_get_learned_capacity(chip, &temp);
+	if (rc < 0 || !temp)
+		temp = temp_normal;
+
+	/* Xiaomi: rescale learned capacities above 5000mAh to nominal */
+	if (temp > 5000000)
+		temp = div_s64(temp * 5000000, temp_normal);
+
 	cc_soc = CAP(0, 100, DIV_ROUND_CLOSEST(chip->cc_soc, 100));
 	*charge_counter = div_s64(temp * cc_soc, 100);
+	chip->param.batt_rmc = *charge_counter;
 
 	return 0;
 }
@@ -2102,6 +2110,199 @@ static int qg_setprop_batt_age_level(struct qpnp_qg *chip, int batt_age_level)
 	return rc;
 }
 
+/* Xiaomi FFC (fast charge) termination currents */
+#define FFC_BATT_FULL_CURRENT_UA		1250000
+#define FFC_HIGH_BATT_FULL_CURRENT_UA		1300000
+#define FFC_CHG_TERM_CURRENT_LOW_TEMP_MA	(-750)
+#define FFC_CHG_TERM_CURRENT_MA			(-1000)
+#define NVT_FFC_CHG_TERM_CURRENT_MA		(-1100)
+#define FFC_CHG_TERM_HIGH_TEMP_THRESH		350	/* 35 degC */
+int qg_get_ffc_iterm_for_qg(struct qpnp_qg *chip)
+{
+	union power_supply_propval prop = {0, };
+	int rc, ffc_qg_iterm = FFC_BATT_FULL_CURRENT_UA;
+
+	if (!is_batt_available(chip)) {
+		pr_err("batt-psy not available\n");
+	} else {
+		rc = power_supply_get_property(chip->batt_psy,
+				POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT, &prop);
+		if (rc < 0) {
+			pr_err("get charge_term_current fail!\n");
+			return ffc_qg_iterm;
+		}
+
+		if (prop.intval == NVT_FFC_CHG_TERM_CURRENT_MA ||
+				prop.intval == FFC_CHG_TERM_CURRENT_MA)
+			ffc_qg_iterm = FFC_HIGH_BATT_FULL_CURRENT_UA;
+		else if (prop.intval != FFC_CHG_TERM_CURRENT_LOW_TEMP_MA)
+			pr_err("not matched chg_term_current = %d\n",
+				prop.intval);
+	}
+
+	pr_info("ffc_batt_full_current=%d\n", ffc_qg_iterm);
+
+	return ffc_qg_iterm;
+}
+
+static int qg_get_ffc_iterm_for_chg(struct qpnp_qg *chip)
+{
+	int rc, batt_temp = 0;
+
+	rc = qg_get_battery_temp(chip, &batt_temp);
+	if (rc < 0) {
+		pr_err("Failed to get battery-temp, rc = %d\n", rc);
+		return rc;
+	}
+
+	if (batt_temp < FFC_CHG_TERM_HIGH_TEMP_THRESH)
+		return FFC_CHG_TERM_CURRENT_LOW_TEMP_MA;
+
+	return chip->nvt_profile ? NVT_FFC_CHG_TERM_CURRENT_MA :
+					FFC_CHG_TERM_CURRENT_MA;
+}
+
+#define SHUTDOWN_DELAY_VOL_LOW_MV	3300
+#define SHUTDOWN_DELAY_VOL_HIGH_MV	3400
+#define DELAY_SOC_ZERO_TIME_MS		30000
+/*
+ * Xiaomi: while the reported SOC is at 1% keep it there (shutdown_delay set)
+ * as long as VBAT is in (3.3V, 3.4V] and the battery is discharging; at or
+ * below 3.3V (or when the SOC is 0) shutdown_delay is dropped and
+ * en_delay_soc_zero is armed for 30s. Note: as in the stock binary the
+ * reported value is 1 on every path here.
+ */
+int qg_get_prop_shutdown_delay(struct qpnp_qg *chip, int *val)
+{
+	int rc, vbat_uv = 0, vbat_mv = 0;
+	static bool last_shutdown_delay;
+
+	if (chip->shutdown_delay_enable && *val <= 1) {
+		rc = qg_get_battery_voltage(chip, &vbat_uv);
+		if (rc < 0)
+			pr_err("Couldn't read batt voltage rc=%d\n", rc);
+		else
+			vbat_mv = vbat_uv / 1000;
+
+		if (chip->charge_status == POWER_SUPPLY_STATUS_CHARGING &&
+				chip->shutdown_delay) {
+			chip->shutdown_delay = false;
+		} else if (vbat_mv <= SHUTDOWN_DELAY_VOL_HIGH_MV) {
+			if (vbat_mv <= SHUTDOWN_DELAY_VOL_LOW_MV) {
+				chip->shutdown_delay = false;
+				*val = 0;
+				goto soc_zero;
+			}
+			if (chip->charge_status ==
+					POWER_SUPPLY_STATUS_DISCHARGING ||
+				chip->charge_status ==
+					POWER_SUPPLY_STATUS_NOT_CHARGING)
+				chip->shutdown_delay = true;
+		}
+		*val = 1;
+		chip->en_delay_soc_zero = 0;
+		cancel_delayed_work_sync(&chip->delay_soc_zero_work);
+		goto out;
+	}
+
+	chip->shutdown_delay = false;
+	if (*val == 0) {
+soc_zero:
+		if (!chip->en_delay_soc_zero) {
+			chip->en_delay_soc_zero = 1;
+			cancel_delayed_work_sync(&chip->delay_soc_zero_work);
+			schedule_delayed_work(&chip->delay_soc_zero_work,
+				msecs_to_jiffies(DELAY_SOC_ZERO_TIME_MS));
+		}
+		*val = 1;
+	} else if (*val > 0) {
+		chip->en_delay_soc_zero = 0;
+		cancel_delayed_work_sync(&chip->delay_soc_zero_work);
+	}
+
+out:
+	if (last_shutdown_delay != chip->shutdown_delay) {
+		last_shutdown_delay = chip->shutdown_delay;
+		power_supply_changed(chip->qg_psy);
+	}
+
+	if (chip->shutdown_delay)
+		pr_info("shutdown_delay in QG is %d \n", chip->shutdown_delay);
+
+	return 0;
+}
+
+static void qg_delay_soc_zero_workfunc(struct work_struct *work)
+{
+	struct qpnp_qg *chip = container_of(work, struct qpnp_qg,
+						delay_soc_zero_work.work);
+
+	chip->en_delay_soc_zero = 0;
+}
+
+#define DEFAULT_SOC_DECIMAL_RATE	10
+static int qg_get_soc_decimal_rate(struct qpnp_qg *chip, int *val)
+{
+	int i, soc = 0;
+
+	qg_get_battery_capacity(chip, &soc);
+
+	if (chip->dt.dec_rate_len <= 0) {
+		*val = DEFAULT_SOC_DECIMAL_RATE;
+		pr_err("Failed to get soc decimal rate, default val:%d\n", *val);
+		return soc;
+	}
+
+	for (i = 0; i < chip->dt.dec_rate_len; i += 2) {
+		if (soc < chip->dt.dec_rate_seq[i]) {
+			*val = chip->dt.dec_rate_seq[i - 1];
+			return soc;
+		}
+	}
+
+	*val = chip->dt.dec_rate_seq[chip->dt.dec_rate_len - 1];
+
+	return soc;
+}
+
+static int qg_get_soc_decimal(struct qpnp_qg *chip, int *val)
+{
+	int dec_rate = 0, soc_dec, soc, hal_soc = 0;
+	static int last_val, last_soc_dec, last_hal_soc;
+
+	qg_get_battery_capacity(chip, &hal_soc);
+	soc_dec = chip->sys_soc % 100;
+	soc = qg_get_soc_decimal_rate(chip, &dec_rate);
+
+	if (soc_dec >= 0 && soc_dec < (50 - dec_rate))
+		*val = soc_dec + 50;
+	else if (soc_dec >= (50 - dec_rate) && soc_dec < 50)
+		*val = soc_dec + 50 - dec_rate;
+	else
+		*val = soc_dec - 50;
+
+	if (last_hal_soc == hal_soc) {
+		if ((last_val > *val && hal_soc != soc) ||
+				(last_soc_dec == soc_dec && hal_soc == soc)) {
+			if (last_val > 50)
+				*val = last_val + (100 - last_val - dec_rate) / 2;
+			else
+				*val = last_val + dec_rate / 4;
+		} else if (last_val > *val) {
+			*val = last_val;
+		}
+	}
+
+	if (last_val != *val)
+		last_val = *val;
+	if (last_soc_dec != soc_dec)
+		last_soc_dec = soc_dec;
+	if (last_hal_soc != hal_soc)
+		last_hal_soc = hal_soc;
+
+	return 0;
+}
+
 static int qg_iio_write_raw(struct iio_dev *indio_dev,
 		struct iio_chan_spec const *chan, int val1,
 		int val2, long mask)
@@ -2138,6 +2339,13 @@ static int qg_iio_write_raw(struct iio_dev *indio_dev,
 		break;
 	case PSY_IIO_CLEAR_SOH:
 		chip->first_profile_load = val1;
+		break;
+	case PSY_IIO_BATT_FULL_CURRENT:
+		/* Xiaomi: keep the FFC iterm after FFC charging ends */
+		chip->keep_ffc_iterm = val1;
+		break;
+	case PSY_IIO_FASTCHARGE_MODE:
+		chip->fastcharge_mode_enabled = val1;
 		break;
 	case PSY_IIO_ESR_ACTUAL:
 		chip->esr_actual = val1;
@@ -2177,6 +2385,11 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 	switch (chan->channel) {
 	case PSY_IIO_CAPACITY:
 		rc = qg_get_battery_capacity(chip, val1);
+		/* Xiaomi: report the smoothed SOC (soc_monitor_work) */
+		if (chip->param.batt_soc >= 0)
+			*val1 = chip->param.batt_soc;
+		if (*val1 <= 1)
+			qg_get_prop_shutdown_delay(chip, val1);
 		break;
 	case PSY_IIO_CAPACITY_RAW:
 		*val1 = chip->sys_soc;
@@ -2220,7 +2433,10 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 		*val1 = chip->bp.float_volt_uv;
 		break;
 	case PSY_IIO_BATT_FULL_CURRENT:
-		*val1 = chip->dt.iterm_ma * 1000;
+		if (chip->fastcharge_mode_enabled)
+			*val1 = qg_get_ffc_iterm_for_qg(chip);
+		else
+			*val1 = chip->dt.iterm_ma * 1000;
 		break;
 	case PSY_IIO_BATT_PROFILE_VERSION:
 		*val1 = chip->bp.qg_profile_version;
@@ -2293,6 +2509,21 @@ static int qg_iio_read_raw(struct iio_dev *indio_dev,
 		break;
 	case PSY_IIO_FG_TYPE:
 		*val1 = chip->qg_mode;
+		break;
+	case PSY_IIO_SHUTDOWN_DELAY:
+		*val1 = chip->shutdown_delay;
+		break;
+	case PSY_IIO_SOC_DECIMAL:
+		rc = qg_get_soc_decimal(chip, val1);
+		break;
+	case PSY_IIO_SOC_DECIMAL_RATE:
+		rc = qg_get_soc_decimal_rate(chip, val1);
+		break;
+	case PSY_IIO_FASTCHARGE_MODE:
+		*val1 = chip->fastcharge_mode_enabled;
+		break;
+	case PSY_IIO_FFC_CHG_TERMINATION_CURRENT:
+		*val1 = qg_get_ffc_iterm_for_chg(chip);
 		break;
 	default:
 		pr_debug("Unsupported QG IIO chan %d\n", chan->channel);
@@ -2367,9 +2598,13 @@ static int qg_charge_full_update(struct qpnp_qg *chip)
 	}
 	chip->recharge_soc = recharge_soc;
 
-	qg_dbg(chip, QG_DEBUG_STATUS, "msoc=%d health=%d charge_full=%d charge_done=%d\n",
+	/*
+	 * Stock passed an extra __func__ before msoc, shifting every value
+	 * of this debug print; fixed here.
+	 */
+	qg_dbg(chip, QG_DEBUG_STATUS, "msoc=%d health=%d charge_full=%d charge_done=%d charge_status=%d\n",
 				chip->msoc, health, chip->charge_full,
-				chip->charge_done);
+				chip->charge_done, chip->charge_status);
 	if (chip->charge_done && !chip->charge_full) {
 		if (chip->msoc >= 99 && health == POWER_SUPPLY_HEALTH_GOOD) {
 			chip->charge_full = true;
@@ -2611,12 +2846,170 @@ static void qg_sleep_exit_work(struct work_struct *work)
 	vote(chip->awake_votable, SLEEP_EXIT_VOTER, false, 0);
 }
 
+/*
+ * Xiaomi reported-SOC smoothing: param.batt_soc follows param.batt_raw_soc
+ * (the QG capacity) by at most 1% per 10/20/60 seconds.
+ */
+static void calculate_average_current(struct qpnp_qg *chip)
+{
+	int i;
+	int iavg_ma = chip->param.batt_ma;
+
+	/* only continue if ibat has changed */
+	if (chip->param.batt_ma == chip->param.batt_ma_prev)
+		goto unchanged;
+	else
+		chip->param.batt_ma_prev = chip->param.batt_ma;
+
+	chip->param.batt_ma_avg_samples[chip->param.samples_index] = iavg_ma;
+	chip->param.samples_index = (chip->param.samples_index + 1) %
+						BATT_MA_AVG_SAMPLES;
+	chip->param.samples_num++;
+
+	if (chip->param.samples_num >= BATT_MA_AVG_SAMPLES)
+		chip->param.samples_num = BATT_MA_AVG_SAMPLES;
+
+	if (chip->param.samples_num) {
+		iavg_ma = 0;
+		/* maintain a AVG_SAMPLES sample average of ibat */
+		for (i = 0; i < chip->param.samples_num; i++)
+			iavg_ma += chip->param.batt_ma_avg_samples[i];
+
+		chip->param.batt_ma_avg = DIV_ROUND_CLOSEST(iavg_ma,
+						chip->param.samples_num);
+	}
+
+unchanged:
+	pr_info("current_now_ma = %d, averaged_iavg_ma = %d\n",
+			chip->param.batt_ma, chip->param.batt_ma_avg);
+}
+
+#define SMOOTH_NORMAL_TEMP		150	/* 15 degC */
+#define HEAVY_LOAD_CURRENT_MA		1000
+#define SMOOTH_CHG_CURRENT_MA		25
+#define SMOOTH_SOC_DELTA		2
+#define FORCE_FULL_RAW_SOC		95
+static void battery_soc_smooth_tracking_new(struct qpnp_qg *chip)
+{
+	static ktime_t last_change_time;
+	int last_batt_soc = chip->param.batt_soc;
+	int time_since_last_change_sec, unit_time, soc_changed;
+	ktime_t now;
+
+	last_change_time = chip->param.last_soc_change_time;
+	now = ktime_get_boottime();
+	time_since_last_change_sec = (int)(ktime_sub(now, last_change_time) /
+						NSEC_PER_SEC);
+	last_change_time = now;
+
+	/* allow a 1% step every unit_time seconds */
+	if (chip->param.batt_temp > SMOOTH_NORMAL_TEMP) {
+		if (chip->param.batt_ma < 0 ||
+			abs(chip->param.batt_raw_soc - chip->param.batt_soc) >
+							SMOOTH_SOC_DELTA)
+			unit_time = 20;
+		else
+			unit_time = 60;
+	} else {
+		calculate_average_current(chip);
+		/*
+		 * Stock: abs(raw - soc > 2), i.e. the "fast" step is only
+		 * taken when the raw SOC is more than 2% above the reported
+		 * one. The behaviour is kept, written without the misplaced
+		 * abs().
+		 */
+		if (chip->param.batt_ma_avg > HEAVY_LOAD_CURRENT_MA ||
+			(chip->param.batt_raw_soc - chip->param.batt_soc) >
+							SMOOTH_SOC_DELTA)
+			unit_time = 10;
+		else
+			unit_time = 20;
+	}
+
+	/* min(1, max(0, time / unit_time)) */
+	soc_changed = max(time_since_last_change_sec, 0) >= unit_time;
+
+	pr_info("smooth_new:soc:%d, last_soc:%d, raw_soc:%d, soc_changed:%d, update_now:%d, charge_status:%d, batt_ma:%d\n",
+		chip->param.batt_soc, last_batt_soc, chip->param.batt_raw_soc,
+		soc_changed, chip->param.update_now, chip->charge_status,
+		chip->param.batt_ma);
+
+	if (last_batt_soc >= 0) {
+		if (last_batt_soc == 100 &&
+			chip->charge_status == POWER_SUPPLY_STATUS_FULL)
+			;	/* hold 100% while full */
+		else if (last_batt_soc != 100 &&
+			chip->param.batt_raw_soc >= FORCE_FULL_RAW_SOC &&
+			chip->charge_status == POWER_SUPPLY_STATUS_FULL)
+			/* Unlikely status */
+			last_batt_soc = chip->param.update_now ?
+					100 : last_batt_soc + soc_changed;
+		else if (last_batt_soc < chip->param.batt_raw_soc &&
+			chip->param.batt_ma < SMOOTH_CHG_CURRENT_MA)
+			/* Battery in charging status */
+			last_batt_soc = chip->param.update_now ?
+				chip->param.batt_raw_soc :
+				last_batt_soc + soc_changed;
+		else if (last_batt_soc > chip->param.batt_raw_soc &&
+			chip->param.batt_ma > -SMOOTH_CHG_CURRENT_MA)
+			/* Battery in discharging status */
+			last_batt_soc = chip->param.update_now ?
+				chip->param.batt_raw_soc :
+				last_batt_soc - soc_changed;
+
+		chip->param.update_now = false;
+	} else {
+		last_batt_soc = chip->param.batt_raw_soc;
+	}
+
+	last_batt_soc = CAP(0, 100, last_batt_soc);
+
+	if (chip->param.batt_soc != last_batt_soc) {
+		chip->param.batt_soc = last_batt_soc;
+		chip->param.last_soc_change_time = last_change_time;
+		if (chip->batt_psy)
+			power_supply_changed(chip->batt_psy);
+	}
+}
+
+#define MONITOR_SOC_WAIT_MS		1000
+#define MONITOR_SOC_WAIT_PER_MS		8000
+static void soc_monitor_work(struct work_struct *work)
+{
+	struct qpnp_qg *chip = container_of(work, struct qpnp_qg,
+						soc_monitor_work.work);
+	int rc, ibat_ua = 0;
+
+	rc = qg_get_battery_current(chip, &ibat_ua);
+	if (rc < 0)
+		pr_err("failed to get battery current, rc = %d\n", rc);
+	chip->param.batt_ma = ibat_ua / 1000;
+
+	rc = qg_get_battery_temp(chip, &chip->param.batt_temp);
+	if (rc < 0)
+		pr_err("failed to get battery temperature, rc = %d\n", rc);
+
+	qg_get_battery_capacity(chip, &chip->param.batt_raw_soc);
+
+	if (chip->soc_reporting_ready)
+		battery_soc_smooth_tracking_new(chip);
+
+	qg_dbg(chip, QG_DEBUG_STATUS, "soc:%d, raw_soc:%d, c:%d, s:%d\n",
+			chip->param.batt_soc, chip->param.batt_raw_soc,
+			chip->param.batt_ma, chip->charge_status);
+
+	schedule_delayed_work(&chip->soc_monitor_work,
+			msecs_to_jiffies(MONITOR_SOC_WAIT_PER_MS));
+}
+
 static void qg_status_change_work(struct work_struct *work)
 {
 	struct qpnp_qg *chip = container_of(work,
 			struct qpnp_qg, qg_status_change_work);
 	union power_supply_propval prop = {0, };
 	int rc = 0, batt_temp = 0, val;
+	int night_charging_working_flag;
+	struct votable *votable;
 	bool input_present = false;
 
 	if (!is_batt_available(chip)) {
@@ -2641,6 +3034,10 @@ static void qg_status_change_work(struct work_struct *work)
 		pr_err("Failed to get charger status, rc=%d\n", rc);
 	else
 		chip->charge_status = prop.intval;
+
+	/* Xiaomi: charging held by the charger (CUSTOM) counts as not charging */
+	if (chip->charge_type == POWER_SUPPLY_CHARGE_TYPE_CUSTOM)
+		chip->charge_status = POWER_SUPPLY_STATUS_NOT_CHARGING;
 
 	rc = qg_read_iio_chan(chip, CHARGE_DONE, &val);
 	if (rc < 0)
@@ -2672,6 +3069,41 @@ static void qg_status_change_work(struct work_struct *work)
 		if (rc < 0) {
 			pr_err("Failed to read BATT_TEMP at PON rc=%d\n", rc);
 		} else if (chip->batt_soc >= 0) {
+			/*
+			 * Xiaomi: while night charging holds the battery
+			 * (NIGHT_CHARGING votable owned by qpnp-smb5's
+			 * battery.c) treat it as not charging.
+			 */
+			votable = find_votable("NIGHT_CHARGING");
+			if (!votable) {
+				pr_err("%s failed to get night_charging_votable\n",
+					__func__);
+				/*
+				 * Stock returned here without pm_relax(),
+				 * leaking the wakeup source taken in
+				 * qg_notifier_cb(); release it.
+				 */
+				goto out;
+			}
+
+			night_charging_working_flag =
+					get_effective_result(votable);
+			if (night_charging_working_flag < 0) {
+				pr_err("%s failed to get night_charging_working_flag\n",
+					__func__);
+				goto out;	/* stock: return, see above */
+			}
+
+			pr_err("%s 3 night_charging_working_flag = %d\n",
+				__func__, night_charging_working_flag);
+			if (night_charging_working_flag) {
+				pr_err("%s 4 night_charging_working, set not_charging\n",
+					__func__);
+				chip->tcss_active = false;
+				chip->charge_status =
+					POWER_SUPPLY_STATUS_NOT_CHARGING;
+			}
+
 			cap_learning_update(chip->cl, batt_temp, chip->batt_soc,
 				chip->charge_status, chip->charge_done,
 				input_present, false);
@@ -3043,6 +3475,13 @@ static int qg_load_battery_profile(struct qpnp_qg *chip)
 	struct device_node *node = chip->dev->of_node;
 	struct device_node *profile_node;
 	int rc, tuple_len, len, i, avail_age_level = 0;
+	union power_supply_propval pval = {0, };
+	static int retry;
+
+	/* Xiaomi: the profile depends on the authenticated battery vendor */
+	chip->batt_verify_psy = power_supply_get_by_name("batt_verify");
+	if (!chip->batt_verify_psy)
+		return -EPROBE_DEFER;
 
 	chip->batt_node = of_find_node_by_name(node, "qcom,battery-data");
 	if (!chip->batt_node) {
@@ -3070,8 +3509,40 @@ static int qg_load_battery_profile(struct qpnp_qg *chip)
 			chip->batt_age_level = avail_age_level;
 		}
 	} else {
-		profile_node = of_batterydata_get_best_profile(chip->batt_node,
-				chip->batt_id_ohm / 1000, NULL);
+		/*
+		 * Xiaomi: batt_verify reports the vendor id of the
+		 * authenticated battery (1 = NVT, 0xff = not ready yet).
+		 */
+		if (!chip->batt_verify_psy) {
+			pr_err("batt_verify_psy is null\n");
+		} else {
+			rc = power_supply_get_property(chip->batt_verify_psy,
+					POWER_SUPPLY_PROP_ONLINE, &pval);
+			if (rc < 0)
+				pr_err("qg_load_battery_profile : get batt id error\n");
+		}
+
+		if (pval.intval == 0xff && retry < 3) {
+			retry++;
+			return -EPROBE_DEFER;
+		}
+
+		if (retry >= 3)
+			pr_err("Battery encryption failed\n");
+
+		if (pval.intval == 1) {
+			profile_node = of_batterydata_get_best_profile(
+					chip->batt_node,
+					chip->batt_id_ohm / 1000,
+					"qbg-battery-profile-nvt-5000mAh");
+			chip->nvt_profile = true;
+		} else {
+			profile_node = of_batterydata_get_best_profile(
+					chip->batt_node,
+					chip->batt_id_ohm / 1000,
+					"qbg-battery-profile-guanyu-5000mAh-new");
+			chip->nvt_profile = false;
+		}
 	}
 
 	if (IS_ERR_OR_NULL(profile_node)) {
@@ -3208,6 +3679,8 @@ static int qg_setup_battery(struct qpnp_qg *chip)
 								rc);
 				chip->profile_loaded = false;
 				chip->soc_reporting_ready = true;
+				/* Xiaomi: fail (or defer) the probe */
+				return rc;
 			} else {
 				chip->profile_loaded = true;
 			}
@@ -3294,22 +3767,38 @@ static int qg_determine_pon_soc(struct qpnp_qg *chip)
 	 * 2. The device was powered off for < ignore_shutdown_time
 	 * 2. Batt temp has not changed more than shutdown_temp_diff
 	 */
-	if (!shutdown[SDAM_VALID])
+	if (!shutdown[SDAM_VALID]) {
+		pr_err("goto use_pon_ocv becase of shutdown[SDAM_VALID]\n");
 		goto use_pon_ocv;
+	}
 
 	if (!is_between(0, chip->dt.ignore_shutdown_soc_secs,
-			(rtc_sec - shutdown[SDAM_TIME_SEC])))
+			(rtc_sec - shutdown[SDAM_TIME_SEC]))) {
+		pr_err("dt.ignore_shutdown_soc_secs is %d, the gap of shutdown_time(%d) is not between [0,%d] \n",
+			chip->dt.ignore_shutdown_soc_secs,
+			(int)(rtc_sec - shutdown[SDAM_TIME_SEC]),
+			chip->dt.ignore_shutdown_soc_secs);
+		pr_err("goto use_pon_ocv becase of shutdown[SDAM_TIME_SEC]\n");
 		goto use_pon_ocv;
+	}
 
 	if (!is_between(0, chip->dt.shutdown_temp_diff,
 			abs(shutdown_temp -  batt_temp)) &&
-			(shutdown_temp < 0 || batt_temp < 0))
+			(shutdown_temp < 0 || batt_temp < 0)) {
+		pr_err("dt.shutdown_temp_diff is %d, shutdown_temp(%d), batt_temp(%d),the gap of temp(%d) is not between [0,%d] \n",
+			chip->dt.shutdown_temp_diff, shutdown_temp, batt_temp,
+			abs(shutdown_temp - batt_temp),
+			chip->dt.shutdown_temp_diff);
+		pr_err("goto use_pon_ocv becase of shutdown_temp_diff\n");
 		goto use_pon_ocv;
+	}
 
 	if ((chip->dt.shutdown_soc_threshold != -EINVAL) &&
 			!is_between(0, chip->dt.shutdown_soc_threshold,
-			abs(pon_soc - shutdown[SDAM_SOC])))
+			abs(pon_soc - shutdown[SDAM_SOC]))) {
+		pr_err("goto use_pon_ocv becase of shutdown_soc_threshold\n");
 		goto use_pon_ocv;
+	}
 
 	use_pon_ocv = false;
 	ocv_uv = shutdown[SDAM_OCV_UV];
@@ -4189,7 +4678,7 @@ static int qg_parse_cl_dt(struct qpnp_qg *chip)
 #define DEFAULT_ESR_LOW_TEMP_THRESHOLD	100 /* 10 deg */
 static int qg_parse_dt(struct qpnp_qg *chip)
 {
-	int rc = 0;
+	int rc = 0, size = 0;
 	struct device_node *child, *node = chip->dev->of_node;
 	u32 base, temp;
 	u8 type;
@@ -4430,10 +4919,46 @@ static int qg_parse_dt(struct qpnp_qg *chip)
 			chip->dt.tcss_entry_soc = temp;
 	}
 
+	chip->shutdown_delay_enable = of_property_read_bool(node,
+					"qcom,shutdown-delay-enable");
+
 	chip->dt.bass_enable = of_property_read_bool(node, "qcom,bass-enable");
 
 	chip->dt.multi_profile_load = of_property_read_bool(node,
 					"qcom,multi-profile-load");
+
+	/* Xiaomi: <soc rate soc rate ...> pairs for the soc_decimal node */
+	size = 0;
+	of_get_property(node, "qcom,soc_decimal_rate", &size);
+	if (size) {
+		chip->dt.dec_rate_seq = devm_kzalloc(chip->dev, size,
+							GFP_KERNEL);
+		if (chip->dt.dec_rate_seq) {
+			chip->dt.dec_rate_len =
+				(size / sizeof(*chip->dt.dec_rate_seq));
+			pr_info("size = %d, size of dec_rate_seq = %d, dt.dec_rate_seq, dt.dec_rate_len = %d \n",
+				size, (int)sizeof(*chip->dt.dec_rate_seq),
+				chip->dt.dec_rate_len);
+			if (chip->dt.dec_rate_len % 2) {
+				pr_err("invalid soc decimal rate seq\n");
+				return -EINVAL;
+			}
+			of_property_read_u32_array(node,
+					"qcom,soc_decimal_rate",
+					chip->dt.dec_rate_seq,
+					chip->dt.dec_rate_len);
+		} else {
+			pr_err("error allocating memory for dec_rate_seq\n");
+		}
+	}
+	/*
+	 * Stock dereferenced dec_rate_seq unconditionally here, which oopses
+	 * when the property is missing; only print when there is a table.
+	 */
+	if (chip->dt.dec_rate_len > 0)
+		pr_info("size=%d dt.dec_rate_len=%d [0]=%d [end]=%d\n", size,
+			chip->dt.dec_rate_len, chip->dt.dec_rate_seq[0],
+			chip->dt.dec_rate_seq[chip->dt.dec_rate_len - 1]);
 
 	qg_dbg(chip, QG_DEBUG_PON, "DT: vbatt_empty_mv=%dmV vbatt_low_mv=%dmV delta_soc=%d ext-sns=%d\n",
 			chip->dt.vbatt_empty_mv, chip->dt.vbatt_low_mv,
@@ -4677,6 +5202,11 @@ static int qpnp_qg_resume(struct device *dev)
 	vote(chip->good_ocv_irq_disable_votable,
 			QG_INIT_STATE_IRQ_DISABLE, false, 0);
 
+	/* Xiaomi: let the smoothed SOC jump to the QG SOC after resume */
+	chip->param.update_now = true;
+	schedule_delayed_work(&chip->soc_monitor_work,
+			msecs_to_jiffies(MONITOR_SOC_WAIT_MS));
+
 	return 0;
 }
 
@@ -4732,6 +5262,9 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 	INIT_WORK(&chip->udata_work, process_udata_work);
 	INIT_WORK(&chip->qg_status_change_work, qg_status_change_work);
 	INIT_DELAYED_WORK(&chip->qg_sleep_exit_work, qg_sleep_exit_work);
+	INIT_DELAYED_WORK(&chip->soc_monitor_work, soc_monitor_work);
+	INIT_DELAYED_WORK(&chip->delay_soc_zero_work,
+				qg_delay_soc_zero_workfunc);
 	mutex_init(&chip->bus_lock);
 	mutex_init(&chip->soc_lock);
 	mutex_init(&chip->data_lock);
@@ -4746,6 +5279,7 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 	chip->esr_actual = -EINVAL;
 	chip->esr_nominal = -EINVAL;
 	chip->batt_age_level = -EINVAL;
+	chip->iio_chan_list_third_cp = NULL;
 
 	config = (struct qg_config *)of_device_get_match_data(
 							&pdev->dev);
@@ -4816,7 +5350,8 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 	rc = qg_soc_init(chip);
 	if (rc < 0) {
 		pr_err("Failed to initialize SOC scaling init rc=%d\n", rc);
-		return rc;
+		/* Xiaomi: retry later */
+		return -EPROBE_DEFER;
 	}
 
 	if (chip->profile_loaded) {
@@ -4913,9 +5448,15 @@ static int qpnp_qg_probe(struct platform_device *pdev)
 		goto fail_votable;
 	}
 
+	/* Xiaomi: external charge pump channels and SOC smoothing */
+	third_cp_iio_init(chip);
+	chip->param.batt_soc = -EINVAL;
+	schedule_delayed_work(&chip->soc_monitor_work,
+			msecs_to_jiffies(MONITOR_SOC_WAIT_MS));
+
 	qg_get_battery_capacity(chip, &soc);
 
-	pr_info("QG initialized! battery_profile=%s SOC=%d QG_subtype=%d QG_version=%s QG_mode=%s\n",
+	pr_err("QG initialized! battery_profile=%s SOC=%d QG_subtype=%d QG_version=%s QG_mode=%s\n",
 			qg_get_battery_type(chip), soc, chip->qg_subtype,
 			(chip->qg_version == QG_LITE) ? "QG_LITE" : "QG_PMIC5",
 			(chip->qg_mode == QG_V_I_MODE) ? "QG_V_I" : "QG_V");
@@ -4939,6 +5480,9 @@ static int qpnp_qg_remove(struct platform_device *pdev)
 	qg_soc_exit(chip);
 
 	cancel_delayed_work_sync(&chip->qg_sleep_exit_work);
+	/* not cancelled by stock: the self-rearming work outlived remove() */
+	cancel_delayed_work_sync(&chip->soc_monitor_work);
+	cancel_delayed_work_sync(&chip->delay_soc_zero_work);
 	cancel_work_sync(&chip->udata_work);
 	cancel_work_sync(&chip->qg_status_change_work);
 	sysfs_remove_groups(&chip->dev->kobj, qg_groups);

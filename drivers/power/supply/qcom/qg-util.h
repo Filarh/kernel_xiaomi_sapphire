@@ -41,4 +41,10 @@ int qg_read_int_iio_chan(struct iio_channel *iio_chan_list, int chan_id,
 int qg_read_range_data_from_node(struct device_node *node,
 		const char *prop_str, struct range_data *ranges,
 		int max_threshold, u32 max_value);
+extern int third_cp_vd;
+bool is_third_cp_chan_valid(struct qpnp_qg *chip,
+			enum third_cp_iio_channel chan);
+int third_cp_get_iio_channel(struct qpnp_qg *chip, enum iio_type type,
+				int channel, int *val);
+int third_cp_iio_init(struct qpnp_qg *chip);
 #endif

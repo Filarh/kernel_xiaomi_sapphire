@@ -21,4 +21,32 @@ struct charger_param {
 
 int qcom_batt_init(struct device *dev, struct charger_param *param);
 void qcom_batt_deinit(void);
+
+/* Xiaomi */
+#include <linux/notifier.h>
+
+enum qpnp_smb5_notifier_events {
+	QPNP_SMB5_NONE_EVENT,
+	QPNP_SMB5_USB_PLUGIN_EVENT,
+	QPNP_SMB5_THERMAL_LEVEL_EVENT,
+	QPNP_SMB5_SMART_CHG_EVENT,
+	QPNP_SMB5_SMART_BATT_EVENT,
+	QPNP_SMB5_NIGHT_CHARGING_EVENT,
+};
+
+extern struct srcu_notifier_head qpnp_smb5_notifier;
+extern int plugin_val;
+
+void set_fv_ageing(int val);
+int get_fv_ageing(void);
+void set_blank_status(int val);
+int qg_batt_get_capacity(void);
+int qg_batt_get_voltage(void);
+int cid_set_prop_typec_power_role(int val);
+int smblib_enable_ship_mode(int enable);
+void set_smb5_rdy(void);
+bool is_smb5_rdy(void);
+int qpnp_smb5_reg_notifier(struct notifier_block *nb);
+int qpnp_smb5_unreg_notifier(struct notifier_block *nb);
+int qpnp_smb5_notifier_call_chain(unsigned long event, int val);
 #endif /* __BATTERY_H */

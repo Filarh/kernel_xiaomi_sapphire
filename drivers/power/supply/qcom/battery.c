@@ -23,6 +23,9 @@
 #include <linux/pmic-voter.h>
 #include <linux/qti_power_supply.h>
 #include <linux/workqueue.h>
+#include <linux/reboot.h>
+#include <linux/notifier.h>
+#include <linux/kobject.h>
 #include <linux/iio/consumer.h>
 #include <dt-bindings/iio/qti_power_supply_iio.h>
 #include "battery.h"
@@ -71,10 +74,12 @@ struct pl_data {
 	struct votable		*cp_disable_votable;
 	struct votable		*fcc_main_votable;
 	struct votable		*cp_slave_disable_votable;
+	struct votable		*quick_charge_type_changed_votable;
 	struct delayed_work	status_change_work;
 	struct work_struct	pl_disable_forever_work;
 	struct work_struct	pl_taper_work;
 	struct delayed_work	fcc_stepper_work;
+	struct delayed_work	xm_prop_change_work;
 	bool			taper_work_running;
 	struct power_supply	*pl_psy;
 	struct power_supply	*batt_psy;
@@ -105,12 +110,28 @@ struct pl_data {
 	int			taper_entry_fv;
 	int			main_fcc_max;
 	int			charger_type;
+	/* Xiaomi */
+	int			usb_real_type;
+	int			typec_mode;
+	int			resistance_id;
+	int			real_capacity;
+	int			smart_chg;
+	int			smart_batt;
+	int			night_charging;
+	int			low_fast_working_flag;
+	struct votable		*low_fast_votable;
+	int			night_charging_working_flag;
+	struct votable		*night_charging_votable;
 	/* debugfs directory */
 	struct dentry		*dfs_root;
 	u32			float_voltage_uv;
 	struct iio_channel	**iio_chan_list_cp;
 	struct iio_channel	*iio_chan_list_cp_slave;
 	struct iio_channel	**iio_chan_list_smb_parallel;
+	struct iio_channel	**iio_chan_list_qg;
+	struct iio_channel	**iio_chan_list_auth;
+	struct iio_channel	**iio_chan_list_third_cp;
+	int			update_cont;
 };
 
 static struct pl_data *the_chip;
@@ -170,6 +191,131 @@ static const char * const bat_smb_parallel_ext_iio_chan[] = {
 	[BAT_SMB_PARALLEL_VOLTAGE_MAX] = "pl_voltage_max",
 	[BAT_SMB_PARALLEL_CHARGE_TYPE] = "pl_charge_type",
 };
+
+/* Xiaomi: QG channels used by the qcom-battery class nodes */
+static const char * const smblib_qg_ext_iio_chan[] = {
+	[SMB5_QG_REAL_CAPACITY] = "real_capacity",
+	[SMB5_QG_RESISTANCE_ID] = "resistance_id",
+	[SMB5_QG_FASTCHARGE_MODE] = "fastcharge_mode",
+	[SMB5_QG_SOC_DECIMAL] = "soc_decimal",
+	[SMB5_QG_SOC_DECIMAL_RATE] = "soc_decimal_rate",
+	[SMB5_QG_SHUTDOWN_DELAY] = "shutdown_delay",
+};
+
+/* Xiaomi: battery authentication channels */
+static const char * const smblib_auth_ext_iio_chan[] = {
+	[AUTH_BATTERY_ID] = "auth_batt_id",
+	[AUTH_CHIP_OK] = "auth_chip_ok",
+	[AUTH_SECRET_MANUFACTURER] = "auth_manufacturer",
+	[AUTH_AUTHENTIC] = "auth_authen_result",
+};
+
+/* Xiaomi: third-party charge pump channels */
+static const char * const third_cp_ext_iio_chan[] = {
+	[THIRD_CP_SC_BUS_CURRENT] = "sc_bus_current",
+	[THIRD_CP_SC_MANUFACTURER] = "sc_manufacturer",
+	[THIRD_CP_BQ_BUS_CURRENT] = "bq_bus_current",
+	[THIRD_CP_BQ_MANUFACTURER] = "bq_manufacturer",
+};
+
+static const char * const power_supply_usb_type_text[] = {
+	"Unknown", "Battery", "UPS", "Mains", "USB",
+	"USB_DCP", "USB_CDP", "USB_ACA", "USB_C",
+	"USB_PD", "USB_PD_DRP", "BrickID", "Wireless",
+	"USB_HVDCP", "USB_HVDCP_3", "USB_HVDCP_3P5", "USB_FLOAT",
+	"BMS", "Parallel", "Main", "Wipower", "UFP", "DFP", "Charge_Pump",
+};
+
+static const char * const power_supply_usbc_text[] = {
+	"Nothing attached", "Sink attached", "Powered cable w/ sink",
+	"Debug Accessory", "Audio Adapter", "Powered cable w/o sink",
+	"Source attached (default current)",
+	"Source attached (medium current)",
+	"Source attached (high current)",
+	"Non compliant",
+};
+
+static const char * const power_supply_cp_manufacturer_text[] = {
+	"Unknown", "sc8541", "bq25960",
+};
+
+static const char * const power_supply_auth_manufacturer_text[] = {
+	"Unknown", "ds28e30", "slg", "stick",
+};
+
+static const char * const power_supply_batt_manufacturer_text[] = {
+	"Unknown", "COSMX", "NVT",
+};
+
+enum power_supply_typec_power_role_g {
+	BAT_POWER_SUPPLY_TYPEC_PR_NONE,		/* CC lines in high-Z */
+	BAT_POWER_SUPPLY_TYPEC_PR_DUAL,
+	BAT_POWER_SUPPLY_TYPEC_PR_SINK,
+	BAT_POWER_SUPPLY_TYPEC_PR_SOURCE,
+};
+
+int fv_ageing;
+int g_blank_status;
+int g_audio_cctog;
+int g_shipmode_en;
+static struct notifier_block reboot_notifier;
+
+void set_fv_ageing(int val)
+{
+	fv_ageing = val;
+}
+EXPORT_SYMBOL(set_fv_ageing);
+
+int get_fv_ageing(void)
+{
+	return fv_ageing;
+}
+EXPORT_SYMBOL(get_fv_ageing);
+
+static bool is_need_set_drp_to_sink(void)
+{
+	int rc, cc_orientation = 0;
+
+	rc = the_chip->chg_param->iio_read(the_chip->dev,
+			PSY_IIO_TYPEC_CC_ORIENTATION, &cc_orientation);
+	pr_err("typec_cc_orientation, cc_orientation=%d, rc=%d\n",
+		cc_orientation, rc);
+	pr_err("%s screen_on is settled to %d, audio_on: %d, plugin_val: %d\n",
+		__func__, g_blank_status, g_audio_cctog, plugin_val);
+
+	if (!cc_orientation && !g_blank_status && !g_audio_cctog) {
+		pr_info("%s need set drp to sink\n", __func__);
+		return true;
+	}
+
+	pr_info("%s needn't set drp to sink\n", __func__);
+	return false;
+}
+
+static void set_drp_status(bool enable)
+{
+	int typec_role = enable ? BAT_POWER_SUPPLY_TYPEC_PR_DUAL :
+				BAT_POWER_SUPPLY_TYPEC_PR_SINK;
+
+	pr_err("%s enable: %d, typec_role: %d\n", __func__, enable,
+		typec_role);
+	cid_set_prop_typec_power_role(typec_role);
+}
+
+void set_blank_status(int val)
+{
+	g_blank_status = !val;
+	if (is_need_set_drp_to_sink()) {
+		pr_info("%s set drp status to sink\n", __func__);
+		set_drp_status(false);
+	} else {
+		pr_info("%s set drp status to try_sink\n", __func__);
+		set_drp_status(true);
+	}
+	pr_err("set blank_status=%d g_audio_cctog= %d\n",
+		g_blank_status, g_audio_cctog);
+}
+EXPORT_SYMBOL(set_blank_status);
 
 /*********
  * HELPER*
@@ -687,6 +833,781 @@ static ssize_t fcc_stepping_in_progress_show(struct class *c,
 }
 static CLASS_ATTR_RO(fcc_stepping_in_progress);
 
+/*****************************
+ * Xiaomi qcom-battery nodes *
+ *****************************/
+static bool is_batt_available(struct pl_data *chip);
+
+static int battery_read_main_iio(struct pl_data *chip, int chan, int *val)
+{
+	return chip->chg_param->iio_read(chip->dev, chan, val);
+}
+
+static int battery_write_main_iio(struct pl_data *chip, int chan, int val)
+{
+	return chip->chg_param->iio_write(chip->dev, chan, val);
+}
+
+static ssize_t usb_real_type_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_TYPEC_MODE, &val);
+	if (val == QTI_POWER_SUPPLY_TYPEC_SINK ||
+			val == QTI_POWER_SUPPLY_TYPEC_SINK_POWERED_CABLE)
+		return scnprintf(buf, PAGE_SIZE, "N/A\n");
+
+	battery_read_main_iio(chip, PSY_IIO_USB_REAL_TYPE, &val);
+	chip->usb_real_type = val;
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(chip->usb_real_type < ARRAY_SIZE(power_supply_usb_type_text)) ?
+		power_supply_usb_type_text[chip->usb_real_type] : "Unknown");
+}
+static CLASS_ATTR_RO(usb_real_type);
+
+static ssize_t real_type_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_TYPEC_MODE, &val);
+	if (val == QTI_POWER_SUPPLY_TYPEC_SINK ||
+			val == QTI_POWER_SUPPLY_TYPEC_SINK_POWERED_CABLE)
+		return scnprintf(buf, PAGE_SIZE, "Unknown\n");
+
+	battery_read_main_iio(chip, PSY_IIO_USB_REAL_TYPE, &val);
+	chip->usb_real_type = val;
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(chip->usb_real_type < ARRAY_SIZE(power_supply_usb_type_text)) ?
+		power_supply_usb_type_text[chip->usb_real_type] : "Unknown");
+}
+static CLASS_ATTR_RO(real_type);
+
+static ssize_t typec_mode_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_TYPEC_MODE, &val);
+	chip->typec_mode = val;
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(chip->typec_mode < ARRAY_SIZE(power_supply_usbc_text)) ?
+		power_supply_usbc_text[chip->typec_mode] : "Unknown");
+}
+static CLASS_ATTR_RO(typec_mode);
+
+static ssize_t resistance_id_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_RESISTANCE_ID], &val);
+	if (rc < 0)
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+	chip->resistance_id = val;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->resistance_id);
+}
+static CLASS_ATTR_RO(resistance_id);
+
+static ssize_t fastcharge_mode_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_FASTCHARGE_MODE], &val);
+	if (rc < 0)
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(fastcharge_mode);
+
+static ssize_t typec_cc_orientation_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_TYPEC_CC_ORIENTATION, &val);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(typec_cc_orientation);
+
+static ssize_t input_suspend_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_INPUT_SUSPEND, &val);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+
+static ssize_t input_suspend_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	rc = battery_write_main_iio(chip, PSY_IIO_INPUT_SUSPEND, val);
+	if (rc < 0)
+		pr_err("Couldn't change input suspend state rc=%d\n", rc);
+
+	return count;
+}
+static CLASS_ATTR_RW(input_suspend);
+
+static bool is_third_cp_chan_valid(struct pl_data *chip,
+				enum third_cp_iio_channels chan)
+{
+	int rc;
+
+	if (IS_ERR(chip->iio_chan_list_third_cp[chan]))
+		return false;
+
+	if (!chip->iio_chan_list_third_cp[chan]) {
+		chip->iio_chan_list_third_cp[chan] = iio_channel_get(chip->dev,
+						third_cp_ext_iio_chan[chan]);
+		if (IS_ERR(chip->iio_chan_list_third_cp[chan])) {
+			rc = PTR_ERR(chip->iio_chan_list_third_cp[chan]);
+			chip->iio_chan_list_third_cp[chan] = NULL;
+			pr_err("Failed to get IIO channel %s, rc=%d\n",
+				third_cp_ext_iio_chan[chan], rc);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int third_cp_get_iio_channel(struct pl_data *chip,
+			enum third_cp_iio_channels chan, int *val)
+{
+	int rc;
+
+	/* sc8541 is the default charge pump, otherwise bq25960 */
+	if (!is_third_cp_chan_valid(chip, THIRD_CP_SC_BUS_CURRENT) &&
+		is_third_cp_chan_valid(chip, THIRD_CP_BQ_BUS_CURRENT))
+		chan += THIRD_CP_BQ_BUS_CURRENT;
+
+	if (!is_third_cp_chan_valid(chip, chan))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(chip->iio_chan_list_third_cp[chan],
+					val);
+
+	return rc < 0 ? rc : 0;
+}
+
+static ssize_t cp_bus_current_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	rc = third_cp_get_iio_channel(chip, THIRD_CP_SC_BUS_CURRENT, &val);
+	if (rc < 0)
+		pr_err("Failed to get sc_bus_current rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(cp_bus_current);
+
+static ssize_t cp_manufacturer_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	rc = third_cp_get_iio_channel(chip, THIRD_CP_SC_MANUFACTURER, &val);
+	if (rc < 0) {
+		val = 0;
+		pr_err("Failed to get sc_manufacturer rc=%d\n", rc);
+	} else {
+		val += 1;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(val < ARRAY_SIZE(power_supply_cp_manufacturer_text)) ?
+		power_supply_cp_manufacturer_text[val] : "Unknown");
+}
+static CLASS_ATTR_RO(cp_manufacturer);
+
+static ssize_t auth_batt_id_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_BATTERY_ID], &val);
+	if (rc < 0)
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(auth_batt_id);
+
+static ssize_t chip_ok_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_CHIP_OK], &val);
+	if (rc < 0)
+		pr_err("Failed to get chip-id rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(chip_ok);
+
+static ssize_t auth_manufacturer_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_SECRET_MANUFACTURER],
+			&val);
+	if (rc < 0) {
+		val = 0;
+		pr_err("Failed to get auth secret id rc=%d\n", rc);
+	} else {
+		val += 1;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(val < ARRAY_SIZE(power_supply_auth_manufacturer_text)) ?
+		power_supply_auth_manufacturer_text[val] : "Unknown");
+}
+static CLASS_ATTR_RO(auth_manufacturer);
+
+static ssize_t batt_manufacturer_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_BATTERY_ID], &val);
+	if (rc < 0) {
+		val = 0;
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+	} else {
+		val += 1;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(val < ARRAY_SIZE(power_supply_batt_manufacturer_text)) ?
+		power_supply_batt_manufacturer_text[val] : "Unknown");
+}
+static CLASS_ATTR_RO(batt_manufacturer);
+
+static ssize_t apdo_max_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, apdo_max, apdo_curr = 0, apdo_volt = 0;
+
+	rc = battery_read_main_iio(chip, PSY_IIO_APDO_CURR, &apdo_curr);
+	if (rc < 0)
+		pr_err("Couldn't get apdo_curr, rc=%d\n", rc);
+
+	rc = battery_read_main_iio(chip, PSY_IIO_APDO_VOLT, &apdo_volt);
+	if (rc < 0)
+		pr_err("Couldn't get apdo_volt, rc=%d\n", rc);
+
+	apdo_max = (apdo_volt * apdo_curr) / 1000000;
+	pr_info("%s:apdo_max is %d \n", __func__, apdo_max);
+
+	return scnprintf(buf, 4, "%d\n", apdo_max);
+}
+static CLASS_ATTR_RO(apdo_max);
+
+static ssize_t quick_charge_type_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	rc = battery_read_main_iio(chip, PSY_IIO_QUICK_CHARGE_TYPE, &val);
+	if (rc < 0)
+		pr_err("Couldn't get quick_charge_type, rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(quick_charge_type);
+
+static ssize_t set_ship_mode_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_SET_SHIP_MODE, &val);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+
+static ssize_t set_ship_mode_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	rc = battery_write_main_iio(chip, PSY_IIO_SET_SHIP_MODE, val);
+	if (rc < 0)
+		pr_err("Couldn't change input suspend state rc=%d\n", rc);
+
+	return count;
+}
+static CLASS_ATTR_RW(set_ship_mode);
+
+static ssize_t shipmode_count_reset_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", g_shipmode_en);
+}
+
+static ssize_t shipmode_count_reset_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	int val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	g_shipmode_en = val;
+
+	return count;
+}
+static CLASS_ATTR_RW(shipmode_count_reset);
+
+static ssize_t thermal_level_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	union power_supply_propval pval = {0, };
+	int rc;
+
+	if (!is_batt_available(chip))
+		return -ENODEV;
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT, &pval);
+	if (rc < 0)
+		pr_err("Couldn't get thermal ret=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", pval.intval);
+}
+static CLASS_ATTR_RO(thermal_level);
+
+static ssize_t authentic_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_AUTHENTIC], &val);
+	if (rc < 0)
+		pr_err("Failed to get chip-id rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(authentic);
+
+static ssize_t soc_decimal_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_SOC_DECIMAL], &val);
+	if (rc < 0)
+		pr_err("Failed to get soc_decimal rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(soc_decimal);
+
+static ssize_t soc_decimal_rate_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_SOC_DECIMAL_RATE], &val);
+	if (rc < 0)
+		pr_err("Failed to get soc_decimal rc=%d\n", rc);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(soc_decimal_rate);
+
+static ssize_t mtbf_current_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int val = 0;
+
+	battery_read_main_iio(chip, PSY_IIO_MTBF_CURRENT, &val);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+
+static ssize_t mtbf_current_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	rc = battery_write_main_iio(chip, PSY_IIO_MTBF_CURRENT, val);
+	if (rc < 0)
+		pr_err("Couldn't change input suspend state rc=%d\n", rc);
+
+	return count;
+}
+static CLASS_ATTR_RW(mtbf_current);
+
+static ssize_t real_capacity_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_REAL_CAPACITY], &val);
+	if (rc < 0)
+		pr_err("Failed to get row_soc, rc=%d\n", rc);
+	chip->real_capacity = val;
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->real_capacity);
+}
+static CLASS_ATTR_RO(real_capacity);
+
+static ssize_t shutdown_delay_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_qg[SMB5_QG_SHUTDOWN_DELAY], &val);
+	if (rc < 0)
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+	pr_info("shutdown_delay from QG is %d \n", val);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", val);
+}
+static CLASS_ATTR_RO(shutdown_delay);
+
+static ssize_t battery_type_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(
+			chip->iio_chan_list_auth[AUTH_BATTERY_ID], &val);
+	if (rc < 0) {
+		val = 0;
+		pr_err("Failed to get batt-id rc=%d\n", rc);
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n",
+		(val == 0) ? "COSMX-5000mAh" :
+		(val == 1) ? "NVT-5000mAh" : "UNKNOWN");
+}
+static CLASS_ATTR_RO(battery_type);
+
+static ssize_t blank_status_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	pr_err("g_blank_status show =%d g_audio_cctog =%d\n",
+		g_blank_status, g_audio_cctog);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", g_blank_status);
+}
+
+static ssize_t blank_status_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	int val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	g_blank_status = val;
+	if (is_need_set_drp_to_sink()) {
+		pr_info("%s set drp status to sink\n", __func__);
+		set_drp_status(false);
+	} else {
+		pr_info("%s set drp status to try_sink\n", __func__);
+		set_drp_status(true);
+	}
+	pr_err("g_blank_status store=%d g_audio_cctog %d\n",
+		g_blank_status, g_audio_cctog);
+
+	return count;
+}
+static CLASS_ATTR_RW(blank_status);
+
+static ssize_t audio_cctog_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	pr_err("g_blank_status =%d g_audio_cctog show =%d\n",
+		g_blank_status, g_audio_cctog);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", g_audio_cctog);
+}
+
+static ssize_t audio_cctog_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	int val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	g_audio_cctog = val;
+	if (is_need_set_drp_to_sink()) {
+		pr_info("%s set drp status to sink\n", __func__);
+		set_drp_status(false);
+	} else {
+		pr_info("%s set drp status to try_sink\n", __func__);
+		set_drp_status(true);
+	}
+	pr_err("g_blank_status =%d g_audio_cctog store =%d\n",
+		g_blank_status, g_audio_cctog);
+
+	return count;
+}
+static CLASS_ATTR_RW(audio_cctog);
+
+static ssize_t smart_chg_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+
+	pr_err("%s Get smart_chg: %d\n", __func__, chip->smart_chg);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->smart_chg);
+}
+
+static ssize_t smart_chg_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	chip->smart_chg = val;
+	pr_err("%s Set smart_chg to %d\n", __func__, chip->smart_chg);
+
+	val = chip->smart_chg;
+	rc = srcu_notifier_call_chain(&qpnp_smb5_notifier,
+			QPNP_SMB5_SMART_CHG_EVENT, &val);
+	if (rc)
+		pr_err("%s: qpnp_smb5_notifier_call_chain error:%d\n",
+			__func__, rc);
+
+	return count;
+}
+static CLASS_ATTR_RW(smart_chg);
+
+static ssize_t smart_batt_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+
+	pr_err("%s Get smart_batt: %d\n", __func__, chip->smart_batt);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->smart_batt);
+}
+
+static ssize_t smart_batt_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	struct votable *fv_votable;
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	chip->smart_batt = val;
+	pr_err("%s Set smart_batt to %d\n", __func__, chip->smart_batt);
+
+	val = chip->smart_batt;
+	rc = srcu_notifier_call_chain(&qpnp_smb5_notifier,
+			QPNP_SMB5_SMART_BATT_EVENT, &val);
+	if (rc)
+		pr_err("%s: qpnp_smb5_notifier_call_chain error:%d\n",
+			__func__, rc);
+
+	fv_votable = find_votable("FV");
+	if (!fv_votable)
+		pr_err("%s failed to get fv_votable\n", __func__);
+	else
+		rerun_election(fv_votable);
+
+	return count;
+}
+static CLASS_ATTR_RW(smart_batt);
+
+static ssize_t night_charging_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+
+	pr_err("%s Get night_charging: %d\n", __func__,
+		chip->night_charging);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chip->night_charging);
+}
+
+static ssize_t night_charging_store(struct class *c,
+		struct class_attribute *attr, const char *buf, size_t count)
+{
+	struct pl_data *chip = container_of(c, struct pl_data,
+			qcom_batt_class);
+	int rc, val = 0;
+
+	if (kstrtoint(buf, 10, &val)) {
+		pr_err("%s kstrtoint fail\n", __func__);
+		return -EINVAL;
+	}
+
+	chip->night_charging = val;
+	pr_err("%s Set night_charging to %d\n", __func__,
+		chip->night_charging);
+
+	val = chip->night_charging;
+	rc = srcu_notifier_call_chain(&qpnp_smb5_notifier,
+			QPNP_SMB5_NIGHT_CHARGING_EVENT, &val);
+	if (rc)
+		pr_err("%s: qpnp_smb5_notifier_call_chain error:%d\n",
+			__func__, rc);
+
+	return count;
+}
+static CLASS_ATTR_RW(night_charging);
+
 static struct attribute *batt_class_attrs[] = {
 	[VER]			= &class_attr_version.attr,
 	[SLAVE_PCT]		= &class_attr_slave_pct.attr,
@@ -694,9 +1615,109 @@ static struct attribute *batt_class_attrs[] = {
 	[RESTRICT_CHG_CURRENT]	= &class_attr_restrict_cur.attr,
 	[FCC_STEPPING_IN_PROGRESS]
 				= &class_attr_fcc_stepping_in_progress.attr,
+	&class_attr_usb_real_type.attr,
+	&class_attr_real_type.attr,
+	&class_attr_typec_mode.attr,
+	&class_attr_resistance_id.attr,
+	&class_attr_fastcharge_mode.attr,
+	&class_attr_typec_cc_orientation.attr,
+	&class_attr_input_suspend.attr,
+	&class_attr_cp_bus_current.attr,
+	&class_attr_cp_manufacturer.attr,
+	&class_attr_auth_batt_id.attr,
+	&class_attr_chip_ok.attr,
+	&class_attr_auth_manufacturer.attr,
+	&class_attr_batt_manufacturer.attr,
+	&class_attr_apdo_max.attr,
+	&class_attr_quick_charge_type.attr,
+	&class_attr_set_ship_mode.attr,
+	&class_attr_shipmode_count_reset.attr,
+	&class_attr_thermal_level.attr,
+	&class_attr_authentic.attr,
+	&class_attr_soc_decimal.attr,
+	&class_attr_soc_decimal_rate.attr,
+	&class_attr_mtbf_current.attr,
+	&class_attr_real_capacity.attr,
+	&class_attr_shutdown_delay.attr,
+	&class_attr_battery_type.attr,
+	&class_attr_blank_status.attr,
+	&class_attr_audio_cctog.attr,
+	&class_attr_smart_chg.attr,
+	&class_attr_smart_batt.attr,
+	&class_attr_night_charging.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(batt_class);
+
+/* Xiaomi: report soc decimal / quick charge type / shutdown delay uevents */
+#define MAX_UEVENT_LENGTH 50
+static void generate_xm_charge_uvent(struct work_struct *work)
+{
+	struct pl_data *chip = container_of(work, struct pl_data,
+					xm_prop_change_work.work);
+	union power_supply_propval pval = {0, };
+	int count, rc;
+	static char uevent_string[][MAX_UEVENT_LENGTH + 1] = {
+		"POWER_SUPPLY_SOC_DECIMAL=\n",
+		"POWER_SUPPLY_SOC_DECIMAL_RATE=\n",
+		"POWER_SUPPLY_QUICK_CHARGE_TYPE=\n",
+		"POWER_SUPPLY_SHUTDOWN_DELAY=\n",
+	};
+	static char *envp[] = {
+		uevent_string[0],
+		uevent_string[1],
+		uevent_string[2],
+		uevent_string[3],
+		NULL,
+	};
+	char *prop_buf = NULL;
+
+	count = chip->update_cont;
+	if (chip->update_cont < 0)
+		return;
+
+	prop_buf = (char *)get_zeroed_page(GFP_KERNEL);
+	if (!prop_buf)
+		return;
+
+	soc_decimal_show(&chip->qcom_batt_class, NULL, prop_buf);
+	strncpy(uevent_string[0] + 25, prop_buf, MAX_UEVENT_LENGTH - 25);
+
+	soc_decimal_rate_show(&chip->qcom_batt_class, NULL, prop_buf);
+	strncpy(uevent_string[1] + 30, prop_buf, MAX_UEVENT_LENGTH - 30);
+
+	quick_charge_type_show(&chip->qcom_batt_class, NULL, prop_buf);
+	strncpy(uevent_string[2] + 31, prop_buf, MAX_UEVENT_LENGTH - 31);
+
+	shutdown_delay_show(&chip->qcom_batt_class, NULL, prop_buf);
+	strncpy(uevent_string[3] + 28, prop_buf, MAX_UEVENT_LENGTH - 28);
+
+	pr_err("uevent test : %s %s count=%d\n", envp[2], envp[3], count);
+
+	kobject_uevent_env(&chip->dev->kobj, KOBJ_CHANGE, envp);
+
+	free_page((unsigned long)prop_buf);
+	chip->update_cont = count - 1;
+
+	if (!chip->batt_psy) {
+		pr_err("uevent: chip->batt_psy addr is NULL !");
+		return;
+	}
+
+	rc = power_supply_get_property(chip->batt_psy,
+			POWER_SUPPLY_PROP_CAPACITY, &pval);
+	if (rc < 0) {
+		pr_err("Couldn't get batt capacity rc=%d\n", rc);
+		return;
+	}
+
+	if (pval.intval > 1)
+		schedule_delayed_work(&chip->xm_prop_change_work,
+				msecs_to_jiffies(500));
+	else
+		schedule_delayed_work(&chip->xm_prop_change_work,
+				msecs_to_jiffies(2000));
+}
 
 /*********
  *  FCC  *
@@ -1302,7 +2323,10 @@ static int pl_fv_vote_callback(struct votable *votable, void *data,
 	if (fv_uv < 0)
 		return 0;
 
-	val = fv_uv;
+	/* Xiaomi: lower float voltage for battery ageing / smart battery */
+	val = fv_uv - (fv_ageing + chip->smart_batt) * 1000;
+	pr_err("%s, fv_uv = %d, smart_batt = %d, fv_ageing = %d, val = %d\n",
+		__func__, fv_uv, chip->smart_batt, fv_ageing, val);
 
 	rc = chip->chg_param->iio_write(chip->dev, PSY_IIO_VOLTAGE_MAX, val);
 	if (rc < 0) {
@@ -1673,6 +2697,48 @@ static int pl_enable_indirect_vote_callback(struct votable *votable,
 	return 0;
 }
 
+#define XM_UEVENT_UPDATE_COUNT		15
+static int quick_charge_type_changed_vote_callback(struct votable *votable,
+			void *data, int changed, const char *client)
+{
+	struct pl_data *chip = data;
+
+	if (changed) {
+		chip->update_cont = XM_UEVENT_UPDATE_COUNT;
+		cancel_delayed_work_sync(&chip->xm_prop_change_work);
+		schedule_delayed_work(&chip->xm_prop_change_work,
+				msecs_to_jiffies(100));
+	} else {
+		cancel_delayed_work_sync(&chip->xm_prop_change_work);
+	}
+
+	return 0;
+}
+
+static int low_fast_vote_callback(struct votable *votable,
+			void *data, int value, const char *client)
+{
+	struct pl_data *chip = data;
+
+	chip->low_fast_working_flag = value;
+	pr_err("%s client: %s low_fast_working_flag: %d\n", __func__,
+		client, value);
+
+	return 0;
+}
+
+static int night_charging_vote_callback(struct votable *votable,
+			void *data, int value, const char *client)
+{
+	struct pl_data *chip = data;
+
+	chip->night_charging_working_flag = value;
+	pr_err("%s client: %s night_charging_working_flag: %d\n", __func__,
+		client, value);
+
+	return 0;
+}
+
 static int pl_awake_vote_callback(struct votable *votable,
 			void *data, int awake, const char *client)
 {
@@ -1998,11 +3064,34 @@ static void status_change_work(struct work_struct *work)
 	handle_parallel_in_taper(chip);
 }
 
+static void iio_update(struct pl_data *chip)
+{
+	struct iio_channel **iio_list;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_qg)) {
+		pr_info("get iio_chan_list_qg ...\n");
+		iio_list = get_ext_channels(chip->dev, smblib_qg_ext_iio_chan,
+					ARRAY_SIZE(smblib_qg_ext_iio_chan));
+		if (!IS_ERR_OR_NULL(iio_list))
+			chip->iio_chan_list_qg = iio_list;
+	}
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_auth)) {
+		pr_info("get iio_chan_list_auth ...\n");
+		iio_list = get_ext_channels(chip->dev, smblib_auth_ext_iio_chan,
+					ARRAY_SIZE(smblib_auth_ext_iio_chan));
+		if (!IS_ERR_OR_NULL(iio_list))
+			chip->iio_chan_list_auth = iio_list;
+	}
+}
+
+#define XM_UEVENT_LOW_VBAT_UV		3351000
 static int pl_notifier_call(struct notifier_block *nb,
 		unsigned long ev, void *v)
 {
 	struct power_supply *psy = v;
 	struct pl_data *chip = container_of(nb, struct pl_data, nb);
+	int rc = 0, capacity, voltage;
 
 	if (ev != PSY_EVENT_PROP_CHANGED)
 		return NOTIFY_OK;
@@ -2010,6 +3099,33 @@ static int pl_notifier_call(struct notifier_block *nb,
 	if ((strcmp(psy->desc->name, "parallel") == 0)
 		|| (strcmp(psy->desc->name, "battery") == 0))
 		schedule_delayed_work(&chip->status_change_work, 0);
+
+	iio_update(chip);
+
+	if (!is_batt_available(chip))
+		return NOTIFY_OK;
+
+	/* Xiaomi: report soc decimal uevents at the end of discharge */
+	capacity = qg_batt_get_capacity();
+	if (!capacity)
+		pr_err("Couldn't get batt capacity rc=%d\n", rc);
+
+	voltage = qg_batt_get_voltage();
+	if (!voltage) {
+		pr_err("Couldn't get voltage prop rc=%d\n", rc);
+		return NOTIFY_OK;
+	}
+
+	if (capacity == 1) {
+		chip->update_cont = XM_UEVENT_UPDATE_COUNT;
+		if (voltage < XM_UEVENT_LOW_VBAT_UV) {
+			generate_xm_charge_uvent(&chip->xm_prop_change_work.work);
+		} else {
+			cancel_delayed_work_sync(&chip->xm_prop_change_work);
+			schedule_delayed_work(&chip->xm_prop_change_work,
+					msecs_to_jiffies(100));
+		}
+	}
 
 	return NOTIFY_OK;
 }
@@ -2026,6 +3142,47 @@ static int pl_register_notifier(struct pl_data *chip)
 	}
 
 	return 0;
+}
+
+/* Xiaomi: enter ship mode on reboot/power off when requested */
+static int reboot_ship_mode(struct notifier_block *nb, unsigned long event,
+				void *unused)
+{
+	int rc;
+
+	if (g_shipmode_en == 1) {
+		rc = smblib_enable_ship_mode(true);
+		if (rc < 0)
+			pr_emerg("Failed to write ship mode: %d\n", rc);
+	}
+
+	return NOTIFY_DONE;
+}
+
+static int shipmode_register_notifier(void)
+{
+	int rc;
+
+	reboot_notifier.notifier_call = reboot_ship_mode;
+	reboot_notifier.priority = 255;
+	rc = register_reboot_notifier(&reboot_notifier);
+	if (rc < 0) {
+		pr_err("Couldn't register reboot notifier rc = %d\n", rc);
+		return rc;
+	}
+
+	return 0;
+}
+
+static void third_cp_iio_init(struct pl_data *chip)
+{
+	pr_err("third_cp_iio_init start\n");
+	chip->iio_chan_list_third_cp = devm_kzalloc(chip->dev,
+			ARRAY_SIZE(third_cp_ext_iio_chan) *
+			sizeof(*chip->iio_chan_list_third_cp), GFP_KERNEL);
+	if (!chip->iio_chan_list_third_cp)
+		return;
+	pr_err("third_cp_iio_init end\n");
 }
 
 static int pl_determine_initial_status(struct pl_data *chip)
@@ -2091,6 +3248,7 @@ int qcom_batt_init(struct device *dev, struct charger_param *chg_param)
 
 	chip->slave_pct = 50;
 	chip->chg_param = chg_param;
+	chip->update_cont = 5;
 	pl_config_init(chip, chg_param->smb_version);
 	chip->restricted_current = DEFAULT_RESTRICTED_CURRENT_UA;
 
@@ -2102,6 +3260,7 @@ int qcom_batt_init(struct device *dev, struct charger_param *chg_param)
 	INIT_WORK(&chip->pl_taper_work, pl_taper_work);
 	INIT_WORK(&chip->pl_disable_forever_work, pl_disable_forever_work);
 	INIT_DELAYED_WORK(&chip->fcc_stepper_work, fcc_stepper_work);
+	INIT_DELAYED_WORK(&chip->xm_prop_change_work, generate_xm_charge_uvent);
 
 	chip->fcc_main_votable = create_votable("FCC_MAIN", VOTE_MIN,
 					pl_fcc_main_vote_callback,
@@ -2172,6 +3331,34 @@ int qcom_batt_init(struct device *dev, struct charger_param *chg_param)
 
 	vote(chip->pl_disable_votable, PL_INDIRECT_VOTER, true, 0);
 
+	chip->quick_charge_type_changed_votable =
+			create_votable("QUICK_CHARGE_TYPE_CHANGED",
+					VOTE_SET_ANY,
+					quick_charge_type_changed_vote_callback,
+					chip);
+	if (IS_ERR(chip->quick_charge_type_changed_votable)) {
+		rc = PTR_ERR(chip->quick_charge_type_changed_votable);
+		chip->quick_charge_type_changed_votable = NULL;
+		goto destroy_votable;
+	}
+
+	chip->low_fast_votable = create_votable("LOW_FAST", VOTE_SET_ANY,
+					low_fast_vote_callback, chip);
+	if (IS_ERR(chip->low_fast_votable)) {
+		rc = PTR_ERR(chip->low_fast_votable);
+		chip->low_fast_votable = NULL;
+		goto destroy_votable;
+	}
+
+	chip->night_charging_votable = create_votable("NIGHT_CHARGING",
+					VOTE_SET_ANY,
+					night_charging_vote_callback, chip);
+	if (IS_ERR(chip->night_charging_votable)) {
+		rc = PTR_ERR(chip->night_charging_votable);
+		chip->night_charging_votable = NULL;
+		goto destroy_votable;
+	}
+
 	rc = pl_register_notifier(chip);
 	if (rc < 0) {
 		pr_err("Couldn't register psy notifier rc = %d\n", rc);
@@ -2196,6 +3383,15 @@ int qcom_batt_init(struct device *dev, struct charger_param *chg_param)
 		goto unreg_notifier;
 	}
 
+	rc = shipmode_register_notifier();
+	if (rc < 0) {
+		pr_err("Couldn't register reboot notifier rc = %d\n", rc);
+		unregister_reboot_notifier(&reboot_notifier);
+		return rc;
+	}
+
+	third_cp_iio_init(chip);
+
 	the_chip = chip;
 
 	return 0;
@@ -2210,6 +3406,7 @@ destroy_votable:
 	destroy_votable(chip->fcc_votable);
 	destroy_votable(chip->fcc_main_votable);
 	destroy_votable(chip->usb_icl_votable);
+	destroy_votable(chip->quick_charge_type_changed_votable);
 release_wakeup_source:
 	wakeup_source_unregister(chip->pl_ws);
 cleanup:
@@ -2236,6 +3433,7 @@ void qcom_batt_deinit(void)
 	destroy_votable(chip->fv_votable);
 	destroy_votable(chip->fcc_votable);
 	destroy_votable(chip->fcc_main_votable);
+	destroy_votable(chip->quick_charge_type_changed_votable);
 	wakeup_source_unregister(chip->pl_ws);
 	the_chip = NULL;
 	kfree(chip);

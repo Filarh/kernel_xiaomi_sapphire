@@ -21,6 +21,7 @@
 #include <linux/iio/consumer.h>
 #include <linux/pmic-voter.h>
 #include <linux/usb/typec.h>
+#include <linux/thermal.h>
 #include "smb5-reg.h"
 #include "smb5-lib.h"
 #include "smb5-iio.h"
@@ -231,6 +232,42 @@ struct smb5 {
 };
 
 static int __debug_mask;
+
+/* Xiaomi: notifier for the charging policy drivers (xm_smart_chg) */
+SRCU_NOTIFIER_HEAD(qpnp_smb5_notifier);
+EXPORT_SYMBOL(qpnp_smb5_notifier);
+
+static bool smb5_rdy;
+
+void set_smb5_rdy(void)
+{
+	pr_err("set smb5_rdy, wake up xm_smart_chg driver\n");
+	smb5_rdy = true;
+}
+
+bool is_smb5_rdy(void)
+{
+	return smb5_rdy;
+}
+EXPORT_SYMBOL(is_smb5_rdy);
+
+int qpnp_smb5_reg_notifier(struct notifier_block *nb)
+{
+	return srcu_notifier_chain_register(&qpnp_smb5_notifier, nb);
+}
+EXPORT_SYMBOL(qpnp_smb5_reg_notifier);
+
+int qpnp_smb5_unreg_notifier(struct notifier_block *nb)
+{
+	return srcu_notifier_chain_unregister(&qpnp_smb5_notifier, nb);
+}
+EXPORT_SYMBOL(qpnp_smb5_unreg_notifier);
+
+int qpnp_smb5_notifier_call_chain(unsigned long event, int val)
+{
+	return srcu_notifier_call_chain(&qpnp_smb5_notifier, event, &val);
+}
+EXPORT_SYMBOL(qpnp_smb5_notifier_call_chain);
 
 static ssize_t pd_disabled_show(struct device *dev, struct device_attribute
 				*attr, char *buf)
@@ -448,6 +485,12 @@ static int smb5_parse_dt_misc(struct smb5 *chip, struct device_node *node)
 
 	chg->jeita_arb_enable = of_property_read_bool(node,
 				"qcom,jeita-arb-enable");
+
+	/* Xiaomi */
+	chg->use_third_cp = of_property_read_bool(node, "mi,use_third_cp");
+	chg->support_ffc = of_property_read_bool(node, "mi,support-ffc");
+	chg->qc_class_ab = of_property_read_bool(node,
+				"qcom,distinguish-qc-class-ab");
 
 	chg->pd_not_supported = chg->pd_not_supported ||
 			of_property_read_bool(node, "qcom,usb-pd-disable");
@@ -880,6 +923,10 @@ static int smb5_usb_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_SCOPE:
 		rc = smblib_get_prop_scope(chg, val);
 		break;
+	/* Xiaomi: pd_active is read through CALIBRATE */
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		rc = smblib_get_prop_pd_active(chg, &val->intval);
+		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		/* USB uses this to set SDP current */
 		val->intval = get_client_vote(chg->usb_icl_votable,
@@ -915,8 +962,12 @@ static int smb5_usb_set_prop(struct power_supply *psy,
 	int rc = 0;
 
 	switch (psp) {
+	/* Xiaomi: PD policy reports pd_active through CALIBRATE */
+	case POWER_SUPPLY_PROP_CALIBRATE:
+		rc = smblib_set_prop_pd_active(chg, val->intval);
+		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
-		rc = smblib_set_prop_sdp_current_max(chg, val->intval);
+		/* Xiaomi: SDP current is not set by the USB stack */
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
 			chg->qc3p5_detected_mw = val->intval;
@@ -937,6 +988,7 @@ static int smb5_usb_prop_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 	case POWER_SUPPLY_PROP_POWER_NOW:
+	case POWER_SUPPLY_PROP_CALIBRATE:
 		return 1;
 	default:
 		break;
@@ -1213,19 +1265,35 @@ static enum power_supply_property smb5_batt_props[] = {
 	POWER_SUPPLY_PROP_CHARGE_FULL,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 };
 
+#define BATT_DESIGN_CAPACITY_UAH	5000000
 #define DEBUG_ACCESSORY_TEMP_DECIDEGC	250
 static int smb5_batt_get_prop(struct power_supply *psy,
 		enum power_supply_property psp,
 		union power_supply_propval *pval)
 {
 	struct smb_charger *chg = power_supply_get_drvdata(psy);
+	union power_supply_propval val = {0, };
+	struct power_supply *batt_psy;
 	int rc = 0;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		rc = smblib_get_prop_batt_status(chg, pval);
+		if (pval->intval == POWER_SUPPLY_STATUS_CHARGING) {
+			batt_psy = power_supply_get_by_name("battery");
+			if (!batt_psy) {
+				pr_err("%s failed to get batt_psy", __func__);
+				return -EINVAL;
+			}
+			if (power_supply_get_property(batt_psy,
+					POWER_SUPPLY_PROP_CAPACITY, &val) < 0) {
+				pr_err("%s failed to get soc_prop", __func__);
+				return -EINVAL;
+			}
+		}
 		break;
 	case POWER_SUPPLY_PROP_HEALTH:
 		rc = smblib_get_prop_batt_health(chg, pval);
@@ -1242,6 +1310,9 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = smblib_get_prop_batt_capacity(chg, pval);
 		break;
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		rc = smblib_get_prop_batt_capacity_level(chg, pval);
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		rc = smblib_get_prop_system_temp_level(chg, pval);
 		break;
@@ -1253,11 +1324,8 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 				SMB5_QG_VOLTAGE_NOW, &pval->intval);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
-		pval->intval = get_client_vote(chg->fv_votable,
-					      QNOVO_VOTER);
-		if (pval->intval < 0)
-			pval->intval = get_client_vote(chg->fv_votable,
-						      BATT_PROFILE_VOTER);
+		/* Xiaomi: report the effective float voltage */
+		pval->intval = get_effective_result(chg->fv_votable);
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		rc = smblib_get_batt_current_now(chg, pval);
@@ -1277,28 +1345,30 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 			QTI_POWER_SUPPLY_TYPEC_SINK_DEBUG_ACCESSORY)
 			pval->intval = DEBUG_ACCESSORY_TEMP_DECIDEGC;
 		else
-			rc = smblib_get_prop_from_bms(chg,
-						SMB5_QG_TEMP, &pval->intval);
+			rc = smblib_get_prop_batt_temp(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_TECHNOLOGY:
-		pval->intval = POWER_SUPPLY_TECHNOLOGY_LION;
+		pval->intval = POWER_SUPPLY_TECHNOLOGY_LIPO;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_COUNTER:
 		rc = smblib_get_prop_from_bms(chg,
 				SMB5_QG_CHARGE_COUNTER, &pval->intval);
 		break;
 	case POWER_SUPPLY_PROP_CYCLE_COUNT:
-		rc = smblib_get_prop_from_bms(chg,
-				SMB5_QG_CYCLE_COUNT, &pval->intval);
+		rc = smblib_get_prop_batt_cycle(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL:
 		rc = smblib_get_prop_from_bms(chg,
 				SMB5_QG_CHARGE_FULL, &pval->intval);
+		/* Xiaomi: never report more than the design capacity */
+		if (pval->intval > BATT_DESIGN_CAPACITY_UAH)
+			pval->intval = BATT_DESIGN_CAPACITY_UAH;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
-		rc = smblib_get_prop_from_bms(chg,
-				SMB5_QG_CHARGE_FULL_DESIGN, &pval->intval);
-		break;
+		pval->intval = BATT_DESIGN_CAPACITY_UAH;
+		pr_info("%s:charge_full_design is %d \n", __func__,
+			pval->intval);
+		return 0;
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
 		rc = smblib_get_prop_from_bms(chg,
 				SMB5_QG_TIME_TO_FULL_NOW, &pval->intval);
@@ -1336,6 +1406,15 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY:
 		rc = smblib_set_prop_batt_capacity(chg, val);
 		break;
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+		rc = smblib_set_prop_batt_cycle(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		rc = smblib_set_prop_batt_temp(chg, val);
+		break;
+	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+		rc = smb5_config_iterm(chg, val->intval, 0);
+		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		chg->batt_profile_fv_uv = val->intval;
 		vote(chg->fv_votable, BATT_PROFILE_VOTER, true, val->intval);
@@ -1358,6 +1437,11 @@ static int smb5_batt_prop_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 	case POWER_SUPPLY_PROP_CAPACITY:
+	/* Xiaomi */
+	case POWER_SUPPLY_PROP_CYCLE_COUNT:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+	case POWER_SUPPLY_PROP_TEMP:
+	case POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
 		return 1;
 	default:
 		break;
@@ -1376,6 +1460,86 @@ static const struct power_supply_desc batt_psy_desc = {
 	.property_is_writeable = smb5_batt_prop_is_writeable,
 };
 
+/*
+ * Xiaomi: register the battery psy as a thermal cooling device driven by
+ * CHARGE_CONTROL_LIMIT (as the pre-5.10 power supply core did).
+ */
+static int ps_get_max_charge_cntl_limit(struct thermal_cooling_device *tcd,
+					unsigned long *state)
+{
+	struct power_supply *psy = tcd->devdata;
+	union power_supply_propval val = {0, };
+	int ret;
+
+	ret = power_supply_get_property(psy,
+			POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX, &val);
+	if (ret)
+		return ret;
+
+	*state = val.intval;
+
+	return ret;
+}
+
+static int ps_get_cur_charge_cntl_limit(struct thermal_cooling_device *tcd,
+					unsigned long *state)
+{
+	struct power_supply *psy = tcd->devdata;
+	union power_supply_propval val = {0, };
+	int ret;
+
+	ret = power_supply_get_property(psy,
+			POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT, &val);
+	if (ret)
+		return ret;
+
+	*state = val.intval;
+
+	return ret;
+}
+
+static int ps_set_cur_charge_cntl_limit(struct thermal_cooling_device *tcd,
+					unsigned long state)
+{
+	struct power_supply *psy = tcd->devdata;
+	union power_supply_propval val;
+
+	val.intval = state;
+
+	return psy->desc->set_property(psy,
+			POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT, &val);
+}
+
+static const struct thermal_cooling_device_ops psy_tcd_ops = {
+	.get_max_state = ps_get_max_charge_cntl_limit,
+	.get_cur_state = ps_get_cur_charge_cntl_limit,
+	.set_cur_state = ps_set_cur_charge_cntl_limit,
+};
+
+static int smb5_register_cooler(struct power_supply *psy)
+{
+	int i;
+
+	/* Register for reducing charging current */
+	for (i = 0; i < psy->desc->num_properties; i++) {
+		if (psy->desc->properties[i] ==
+				POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT) {
+			if (psy->dev.parent)
+				psy->tcd = thermal_of_cooling_device_register(
+						dev_of_node(psy->dev.parent),
+						(char *)psy->desc->name,
+						psy, &psy_tcd_ops);
+			else
+				psy->tcd = thermal_cooling_device_register(
+						(char *)psy->desc->name,
+						psy, &psy_tcd_ops);
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
 static int smb5_init_batt_psy(struct smb5 *chip)
 {
 	struct power_supply_config batt_cfg = {};
@@ -1391,6 +1555,8 @@ static int smb5_init_batt_psy(struct smb5 *chip)
 		pr_err("Couldn't register battery power supply\n");
 		return PTR_ERR(chg->batt_psy);
 	}
+
+	rc = smb5_register_cooler(chg->batt_psy);
 
 	return rc;
 }
@@ -1510,8 +1676,8 @@ static int smb5_configure_typec(struct smb_charger *chg)
 			return rc;
 		}
 
-		/* delay before enabling typeC */
-		msleep(50);
+		/* delay before enabling typeC (Xiaomi: 300ms) */
+		msleep(300);
 
 		val = QTI_POWER_SUPPLY_TYPEC_PR_DUAL;
 		rc = smblib_set_prop_typec_power_role(chg, val);
@@ -3020,6 +3186,7 @@ static int smb5_probe(struct platform_device *pdev)
 	struct smb_charger *chg;
 	int rc = 0;
 
+	pr_err("smb5_probe ++\n");
 	indio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*chip));
 	if (!indio_dev)
 		return -ENOMEM;
@@ -3051,6 +3218,7 @@ static int smb5_probe(struct platform_device *pdev)
 	chg->connector_health = -EINVAL;
 	chg->otg_present = false;
 	chg->main_fcc_max = -EINVAL;
+	chg->fake_temp = -EINVAL;
 	mutex_init(&chg->adc_lock);
 
 	chg->regmap = dev_get_regmap(chg->dev->parent, NULL);
@@ -3166,6 +3334,8 @@ static int smb5_probe(struct platform_device *pdev)
 		goto cleanup;
 	}
 
+	device_init_wakeup(chg->dev, true);
+
 	rc = smb5_determine_initial_status(chip);
 	if (rc < 0) {
 		pr_err("Couldn't determine initial status rc=%d\n",
@@ -3199,9 +3369,9 @@ static int smb5_probe(struct platform_device *pdev)
 		goto free_irq;
 	}
 
-	device_init_wakeup(chg->dev, true);
+	set_smb5_rdy();
 
-	pr_info("QPNP SMB5 probed successfully\n");
+	pr_err("QPNP SMB5 probed successfully\n");
 
 	return rc;
 
@@ -3227,6 +3397,9 @@ static int smb5_remove(struct platform_device *pdev)
 	smblib_deinit(chg);
 	sysfs_remove_groups(&chg->dev->kobj, smb5_groups);
 	platform_set_drvdata(pdev, NULL);
+
+	if (!IS_ERR_OR_NULL(chg->batt_psy->tcd))
+		thermal_cooling_device_unregister(chg->batt_psy->tcd);
 
 	return 0;
 }

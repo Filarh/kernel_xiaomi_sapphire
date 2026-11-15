@@ -102,6 +102,12 @@ static const struct qg_iio_channels qg_iio_psy_channels[] = {
 	QG_CHAN_ACT("scale_mode_en", PSY_IIO_SCALE_MODE_EN)
 	QG_CHAN_INDEX("batt_age_level", PSY_IIO_BATT_AGE_LEVEL)
 	QG_CHAN_ACT("fg_type", PSY_IIO_FG_TYPE)
+	QG_CHAN_ACT("fastcharge_mode", PSY_IIO_FASTCHARGE_MODE)
+	QG_CHAN_ACT("ffc_chg_termination_current",
+				PSY_IIO_FFC_CHG_TERMINATION_CURRENT)
+	QG_CHAN_ENERGY("soc_decimal", PSY_IIO_SOC_DECIMAL)
+	QG_CHAN_ENERGY("soc_decimal_rate", PSY_IIO_SOC_DECIMAL_RATE)
+	QG_CHAN_ACT("shutdown_delay", PSY_IIO_SHUTDOWN_DELAY)
 };
 
 enum qg_ext_iio_channels {
@@ -111,6 +117,7 @@ enum qg_ext_iio_channels {
 	CHARGE_DONE,
 	PARALLEL_CHARGING_ENABLED,
 	CP_CHARGING_ENABLED,
+	USB_REAL_TYPE,
 };
 
 static const char * const qg_ext_iio_chan_name[] = {
@@ -120,6 +127,22 @@ static const char * const qg_ext_iio_chan_name[] = {
 	[CHARGE_DONE]			= "charge_done",
 	[PARALLEL_CHARGING_ENABLED]	= "parallel_charging_enabled",
 	[CP_CHARGING_ENABLED]		= "cp_charging_enabled",
+	[USB_REAL_TYPE]			= "real_type",
+};
+
+/* external charge pump (sc8541 / bq25960) channels read by the QG */
+enum third_cp_iio_channel {
+	CHARGE_PUMP_CHARGING_ENABLED = 0,
+	CHARGE_PUMP_SC_BATTERY_VOLTAGE,
+	CHARGE_PUMP_BQ_CHARGING_ENABLED = 5,
+	CHARGE_PUMP_BQ_BATTERY_VOLTAGE,
+};
+
+static const char * const third_cp_ext_iio_chan[] = {
+	[CHARGE_PUMP_CHARGING_ENABLED]		= "charging_enabled",
+	[CHARGE_PUMP_SC_BATTERY_VOLTAGE]	= "sc_battery_voltage",
+	[CHARGE_PUMP_BQ_CHARGING_ENABLED]	= "bq_charging_enabled",
+	[CHARGE_PUMP_BQ_BATTERY_VOLTAGE]	= "bq_battery_voltage",
 };
 
 #endif

@@ -21,6 +21,8 @@
 #include "storm-watch.h"
 #include "battery.h"
 
+struct usbpd;
+
 enum print_reason {
 	PR_INTERRUPT	= BIT(0),
 	PR_REGISTER	= BIT(1),
@@ -84,6 +86,36 @@ enum print_reason {
 #define ICL_CHANGE_VOTER		"ICL_CHANGE_VOTER"
 #define OVERHEAT_LIMIT_VOTER		"OVERHEAT_LIMIT_VOTER"
 #define TYPEC_SWAP_VOTER		"TYPEC_SWAP_VOTER"
+/* Xiaomi */
+#define QC2_UNSUPPORTED_VOTER		"QC2_UNSUPPORTED_VOTER"
+#define HVDCP3_START_ICL_VOTER		"HVDCP3_START_ICL_VOTER"
+#define CLASSA_QC_FCC_VOTER		"CLASSA_QC_FCC_VOTER"
+#define QC_A_CP_ICL_MAX_VOTER		"QC_A_CP_ICL_MAX_VOTER"
+#define MAIN_CHG_VOTER			"MAIN_CHG_VOTER"
+#define MAIN_ICL_MIN_VOTER		"MAIN_ICL_MIN_VOTER"
+#define NON_FFC_VFLOAT_VOTER		"NON_FFC_VFLOAT_VOTER"
+#define PD_VERIFED_VOTER		"PD_VERIFED_VOTER"
+#define CHG_AWAKE_VOTER			"CHG_AWAKE_VOTER"
+#define QUICK_CHARGE_TYPE_CHANGED_VOTER	"QUICK_CHARGE_TYPE_CHANGED_VOTER"
+
+#define MAIN_ICL_MIN			100000
+#define SUSPEND_ICL_UA			100000
+
+enum quick_charge_type {
+	QUICK_CHARGE_NORMAL = 0,
+	QUICK_CHARGE_FAST,
+	QUICK_CHARGE_FLASH,
+	QUICK_CHARGE_TURBE,
+	QUICK_CHARGE_SUPER,
+	QUICK_CHARGE_MAX,
+};
+
+enum smb5_hvdcp3_type {
+	SMB5_HVDCP3_NONE = 0,
+	SMB5_HVDCP3_CLASSA_18W,
+	SMB5_HVDCP3_CLASSB_27W,
+};
+
 
 #define BOOST_BACK_STORM_COUNT	3
 #define WEAK_CHG_STORM_COUNT	8
@@ -392,6 +424,7 @@ struct smb_charger {
 	struct iio_channel	*iio_chans;
 	struct iio_channel	**iio_chan_list_qg;
 	struct iio_channel	**iio_chan_list_cp;
+	struct iio_channel	**iio_chan_list_third_cp;
 	struct iio_channel	**iio_chan_list_smb_parallel;
 	int			*debug_mask;
 	int			pd_disabled;
@@ -459,6 +492,8 @@ struct smb_charger {
 	struct votable		*temp_change_irq_disable_votable;
 	struct votable		*bat_temp_irq_disable_votable;
 	struct votable		*qnovo_disable_votable;
+	struct votable		*shutdown_delay_changed_votable;
+	struct votable		*quick_charge_type_changed_votable;
 
 	/* work */
 	struct work_struct	bms_update_work;
@@ -481,6 +516,8 @@ struct smb_charger {
 	struct delayed_work	pr_swap_detach_work;
 	struct delayed_work	pr_lock_clear_work;
 	struct delayed_work	role_reversal_check;
+	struct delayed_work	raise_qc3_vbus_work;
+	struct delayed_work	float_retry_work;
 
 	struct alarm		lpd_recheck_timer;
 	struct alarm		moisture_protection_alarm;
@@ -518,6 +555,8 @@ struct smb_charger {
 	int			*thermal_mitigation;
 	int			dcp_icl_ua;
 	int			fake_capacity;
+	int			fake_cycle;
+	int			fake_temp;
 	int			fake_batt_status;
 	bool			step_chg_enabled;
 	bool			sw_jeita_enabled;
@@ -618,6 +657,14 @@ struct smb_charger {
 	int			die_health;
 	int			connector_health;
 
+	/* qc2/qc3 */
+	bool			qc_class_ab;
+	bool			is_qc_class_a;
+	bool			is_qc_class_b;
+	bool			raise_vbus_to_detect;
+	bool			detect_low_power_qc3_charger;
+	bool			high_vbus_detected;
+
 	/* flash */
 	u32			flash_derating_soc;
 	u32			flash_disable_soc;
@@ -630,7 +677,55 @@ struct smb_charger {
 	int			dcin_uv_count;
 	ktime_t			dcin_uv_last_time;
 	int			last_wls_vout;
+
+	/* Xiaomi */
+	struct usbpd		*pd;
+	bool			cp_input_suspend;
+	bool			use_third_cp;
+	bool			support_ffc;
+	bool			maintain_ffc_iterm;
+	int			apdo_volt;
+	int			apdo_curr;
+	int			quick_charge_type;
+	int			input_suspend;
+	int			mtbf_curr;
+	bool			qc2_unsupported;
+	int			float_retry_flag;
+	int			dpdm_qc3p0_flag;
 };
+
+/* Xiaomi */
+extern struct smb_charger *g_chg;
+extern int batt_capacity;
+extern int batt_volt_uv;
+int audio_get_prop_typec_mode(void);
+int smblib_get_prop_batt_capacity_level(struct smb_charger *chg,
+				union power_supply_propval *val);
+int smblib_get_prop_batt_cycle(struct smb_charger *chg,
+				union power_supply_propval *val);
+int smblib_get_prop_batt_temp(struct smb_charger *chg,
+				union power_supply_propval *val);
+int smblib_set_prop_batt_cycle(struct smb_charger *chg,
+				const union power_supply_propval *val);
+int smblib_set_prop_batt_temp(struct smb_charger *chg,
+				const union power_supply_propval *val);
+int smblib_get_fastcharge_mode(struct smb_charger *chg);
+int smblib_set_fastcharge_mode(struct smb_charger *chg, bool enable);
+int smblib_get_prop_battery_charging_enabled(struct smb_charger *chg,
+				int *val);
+int smblib_get_prop_battery_charging_limited(struct smb_charger *chg,
+				int *val);
+int smblib_get_prop_battery_cp_input_suspend(struct smb_charger *chg,
+				int *val);
+int smb5_config_iterm(struct smb_charger *chg, int term_current,
+				int term_current_low);
+int smblib_set_recharge_mode(struct smb_charger *chg, int enable);
+int smblib_get_recharge_mode(struct smb_charger *chg);
+int smblib_get_quick_charge_type(struct smb_charger *chg,
+				union power_supply_propval *val);
+int smblib_get_prop_pd_active(struct smb_charger *chg, int *val);
+int smblib_get_prop_ship_mode(struct smb_charger *chg, int *val);
+int smblib_dp_dm_cp(struct smb_charger *chg, int val);
 
 int smblib_read(struct smb_charger *chg, u16 addr, u8 *val);
 int smblib_masked_write(struct smb_charger *chg, u16 addr, u8 mask, u8 val);

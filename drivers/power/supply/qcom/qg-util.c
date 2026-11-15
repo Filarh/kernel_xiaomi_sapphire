@@ -520,6 +520,75 @@ int qg_read_iio_chan(struct qpnp_qg *chip,
 	return -EINVAL;
 }
 
+/* vendor of the external charge pump, probed lazily (enum master_cp_vd) */
+int third_cp_vd;
+
+bool is_third_cp_chan_valid(struct qpnp_qg *chip,
+			enum third_cp_iio_channel chan)
+{
+	int rc;
+
+	if (IS_ERR_OR_NULL(chip->iio_chan_list_third_cp)) {
+		pr_err("%s IIO channel is not init, return\n", __func__);
+		return false;
+	}
+
+	if (IS_ERR(chip->iio_chan_list_third_cp[chan])) {
+		pr_err("%s IIO channel is error, return\n", __func__);
+		return false;
+	}
+
+	if (!chip->iio_chan_list_third_cp[chan]) {
+		chip->iio_chan_list_third_cp[chan] = iio_channel_get(chip->dev,
+					third_cp_ext_iio_chan[chan]);
+		if (IS_ERR(chip->iio_chan_list_third_cp[chan])) {
+			rc = PTR_ERR(chip->iio_chan_list_third_cp[chan]);
+			chip->iio_chan_list_third_cp[chan] = NULL;
+			pr_err("Failed to get IIO channel %s, rc=%d\n",
+				third_cp_ext_iio_chan[chan], rc);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+int third_cp_get_iio_channel(struct qpnp_qg *chip, enum iio_type type,
+				int channel, int *val)
+{
+	int rc;
+
+	if (type != THIRD_CP) {
+		pr_err("iio_type %d is not supported\n", type);
+		return -EINVAL;
+	}
+
+	if (third_cp_vd == THIRD_CP_NONE) {
+		pr_err("%s third_cp_vd is none . get cp vd\n", __func__);
+		if (is_third_cp_chan_valid(chip, CHARGE_PUMP_CHARGING_ENABLED)) {
+			third_cp_vd = THIRD_CP_SC;
+		} else if (is_third_cp_chan_valid(chip,
+					CHARGE_PUMP_BQ_CHARGING_ENABLED)) {
+			third_cp_vd = THIRD_CP_BQ;
+		} else {
+			third_cp_vd = THIRD_CP_NONE;
+			pr_err("%s Failed to get cp vendor\n", __func__);
+			return -ENODEV;
+		}
+	}
+
+	/* the bq25960 channels follow the sc8541 ones in the table */
+	if (third_cp_vd == THIRD_CP_BQ)
+		channel += CHARGE_PUMP_BQ_CHARGING_ENABLED;
+
+	if (!is_third_cp_chan_valid(chip, channel))
+		return -ENODEV;
+
+	rc = iio_read_channel_processed(chip->iio_chan_list_third_cp[channel],
+					val);
+	return (rc < 0) ? rc : 0;
+}
+
 int qg_write_iio_chan(struct qpnp_qg *chip,
 	enum qg_ext_iio_channels chan, int val)
 {
@@ -616,4 +685,20 @@ int qg_read_range_data_from_node(struct device_node *node,
 clean:
 	memset(ranges, 0, tuples * sizeof(struct range_data));
 	return rc;
+}
+
+int third_cp_iio_init(struct qpnp_qg *chip)
+{
+	pr_err("third_cp_iio_init start\n");
+
+	chip->iio_chan_list_third_cp = devm_kcalloc(chip->dev,
+				ARRAY_SIZE(third_cp_ext_iio_chan),
+				sizeof(*chip->iio_chan_list_third_cp),
+				GFP_KERNEL);
+	if (!chip->iio_chan_list_third_cp)
+		return -ENOMEM;
+
+	pr_err("third_cp_iio_init end\n");
+
+	return 0;
 }

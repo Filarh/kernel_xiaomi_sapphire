@@ -14,6 +14,9 @@
 #include "schgm-flash.h"
 
 #define MIN_THERMAL_VOTE_UA	500000
+/* Xiaomi: main charger ICL while the charge pump charges */
+#define MAIN_CHG_LIMIT_ICL_UA		2000000
+#define MAIN_CHG_LIMIT_HVDCP3_ICL_UA	500000
 
 int smb5_iio_get_prop(struct smb_charger *chg, int channel, int *val)
 {
@@ -38,7 +41,15 @@ int smb5_iio_get_prop(struct smb_charger *chg, int channel, int *val)
 		*val = get_client_vote(chg->usb_icl_votable, PD_VOTER);
 		break;
 	case PSY_IIO_USB_REAL_TYPE:
-		*val = chg->real_charger_type;
+		/* Xiaomi: report PD while PD is active, reset APDO otherwise */
+		if (!chg->pd_active) {
+			*val = chg->real_charger_type;
+			chg->apdo_volt = 0;
+			chg->apdo_curr = 0;
+		} else {
+			*val = POWER_SUPPLY_TYPE_USB_PD;
+		}
+		pr_info("real_type=%d\n", *val);
 		break;
 	case PSY_IIO_TYPEC_MODE:
 		rc = smblib_get_usb_prop_typec_mode(chg, val);
@@ -249,8 +260,8 @@ int smb5_iio_get_prop(struct smb_charger *chg, int channel, int *val)
 		rc = smblib_get_prop_batt_charge_done(chg, val);
 		break;
 	case PSY_IIO_SET_SHIP_MODE:
-		/* Not in ship mode as long as device is active */
-		*val = 0;
+		/* Xiaomi: report the real ship mode state */
+		rc = smblib_get_prop_ship_mode(chg, val);
 		break;
 	case PSY_IIO_RERUN_AICL:
 		*val = 0;
@@ -275,6 +286,52 @@ int smb5_iio_get_prop(struct smb_charger *chg, int channel, int *val)
 		break;
 	case PSY_IIO_TYPEC_ACCESSORY_MODE:
 		rc = smblib_get_usb_prop_typec_accessory_mode(chg, val);
+		break;
+	/* Xiaomi */
+	case PSY_IIO_INPUT_SUSPEND:
+		*val = chg->input_suspend;
+		break;
+	case PSY_IIO_APDO_VOLT:
+		*val = chg->apdo_volt;
+		break;
+	case PSY_IIO_APDO_CURR:
+		*val = chg->apdo_curr;
+		break;
+	case PSY_IIO_CP_INPUT_SUSPEND:
+		rc = smblib_get_prop_battery_cp_input_suspend(chg,
+						&pval.intval);
+		*val = pval.intval;
+		break;
+	case PSY_IIO_BATTERY_CHARGING_ENABLED:
+		rc = smblib_get_prop_battery_charging_enabled(chg,
+						&pval.intval);
+		*val = pval.intval;
+		break;
+	case PSY_IIO_BATTERY_CHARGING_LIMITED:
+		rc = smblib_get_prop_battery_charging_limited(chg,
+						&pval.intval);
+		*val = pval.intval;
+		break;
+	case PSY_IIO_QUICK_CHARGE_TYPE:
+		rc = smblib_get_quick_charge_type(chg, &pval);
+		*val = pval.intval;
+		break;
+	case PSY_IIO_SM_FASTCHARGE_MODE:
+		*val = smblib_get_fastcharge_mode(chg);
+		break;
+	case PSY_IIO_MTBF_CURRENT:
+		*val = get_client_vote(chg->usb_icl_votable,
+					USB_PSY_VOTER) / 1000;
+		pr_info("%s:mtbf_current is %d \n", __func__, *val);
+		break;
+	case PSY_IIO_RECHARGE_MODE:
+		*val = smblib_get_recharge_mode(chg);
+		break;
+	case PSY_IIO_HVDCP3_TYPE:
+		if (chg->is_qc_class_a)
+			*val = SMB5_HVDCP3_CLASSA_18W;
+		else if (chg->is_qc_class_b)
+			*val = SMB5_HVDCP3_CLASSB_27W;
 		break;
 	default:
 		pr_err("get prop %d is not supported\n", channel);
@@ -498,8 +555,9 @@ int smb5_iio_set_prop(struct smb_charger *chg, int channel, int val)
 		rc = smblib_run_aicl(chg, RERUN_AICL);
 		break;
 	case PSY_IIO_DP_DM:
-		if (!chg->flash_active)
-			rc = smblib_dp_dm(chg, val);
+		/* Xiaomi: QC3 pulses only via the third-party CP flow */
+		if (chg->use_third_cp)
+			rc = smblib_dp_dm_cp(chg, val);
 		break;
 	case PSY_IIO_INPUT_CURRENT_LIMITED:
 		rc = smblib_set_prop_input_current_limited(chg, val);
@@ -523,6 +581,48 @@ int smb5_iio_set_prop(struct smb_charger *chg, int channel, int val)
 		break;
 	case PSY_IIO_FCC_STEPPER_ENABLE:
 		chg->fcc_stepper_enable = val;
+		break;
+	/* Xiaomi */
+	case PSY_IIO_INPUT_SUSPEND:
+		chg->input_suspend = val;
+		pval.intval = val;
+		rc = smblib_set_prop_input_suspend(chg, &pval);
+		break;
+	case PSY_IIO_BATTERY_CHARGING_ENABLED:
+		vote(chg->usb_icl_votable, MAIN_ICL_MIN_VOTER, !val,
+			val ? 0 : MAIN_ICL_MIN);
+		break;
+	case PSY_IIO_BATTERY_CHARGING_LIMITED:
+		if (chg->use_third_cp) {
+			if (!val)
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER, false,
+					MAIN_CHG_LIMIT_ICL_UA);
+			else if (real_chg_type ==
+					QTI_POWER_SUPPLY_TYPE_USB_HVDCP_3)
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER, true,
+					MAIN_CHG_LIMIT_HVDCP3_ICL_UA);
+			else
+				vote(chg->usb_icl_votable, MAIN_CHG_VOTER, true,
+					MAIN_CHG_LIMIT_ICL_UA);
+			rerun_election(chg->usb_icl_votable);
+		}
+		/* stock falls through and also stores the value as apdo_volt */
+		fallthrough;
+	case PSY_IIO_APDO_VOLT:
+		chg->apdo_volt = val;
+		return 0;
+	case PSY_IIO_APDO_CURR:
+		chg->apdo_curr = val;
+		return 0;
+	case PSY_IIO_SM_FASTCHARGE_MODE:
+		rc = smblib_set_fastcharge_mode(chg, val);
+		break;
+	case PSY_IIO_MTBF_CURRENT:
+		chg->mtbf_curr = val * 1000;
+		rc = smblib_set_prop_sdp_current_max(chg, chg->mtbf_curr);
+		break;
+	case PSY_IIO_RECHARGE_MODE:
+		rc = smblib_set_recharge_mode(chg, val);
 		break;
 	default:
 		pr_err("get prop %d is not supported\n", channel);
@@ -557,6 +657,7 @@ struct iio_channel **get_ext_channels(struct device *dev,
 			if (rc != -EPROBE_DEFER)
 				dev_err(dev, "%s channel unavailable, %d\n",
 						channel_map[i], rc);
+			devm_kfree(dev, iio_ch_ext);
 			return ERR_PTR(rc);
 		}
 	}

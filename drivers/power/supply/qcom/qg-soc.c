@@ -97,7 +97,8 @@ static ssize_t fvss_delta_soc_interval_ms_store(struct device *dev,
 }
 DEVICE_ATTR_RW(fvss_delta_soc_interval_ms);
 
-static int qg_delta_soc_cold_interval_ms = 4000;
+/* Xiaomi: 60s (CLO 4s) */
+static int qg_delta_soc_cold_interval_ms = 60000;
 static ssize_t soc_cold_interval_ms_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -233,12 +234,13 @@ exit_soc_scale:
 	return sys_soc;
 }
 
-#define IBAT_HYST_PC			10
+/* Xiaomi: 40% (CLO 10%) */
+#define IBAT_HYST_PC			40
 #define TCSS_ENTRY_COUNT		2
 static int qg_process_tcss_soc(struct qpnp_qg *chip, int sys_soc)
 {
 	int rc, ibatt_diff = 0, ibat_inc_hyst = 0;
-	int qg_iterm_ua = (-1 * chip->dt.iterm_ma * 1000);
+	int qg_iterm_ua;
 	int soc_ibat, wt_ibat, wt_sys, val;
 	union power_supply_propval prop = {0, };
 
@@ -251,10 +253,18 @@ static int qg_process_tcss_soc(struct qpnp_qg *chip, int sys_soc)
 	if (chip->sys_soc >= QG_MAX_SOC && chip->soc_tcss >= QG_MAX_SOC)
 		goto exit_soc_scale;
 
+	/* Xiaomi: use the FFC termination current while fast charging */
+	if (chip->fastcharge_mode_enabled || chip->keep_ffc_iterm) {
+		qg_iterm_ua = -qg_get_ffc_iterm_for_qg(chip);
+		pr_err("[%s] qg_iterm_ua=%d\n", __func__, qg_iterm_ua);
+	} else {
+		qg_iterm_ua = (-1 * chip->dt.iterm_ma * 1000);
+	}
+
+	/* Xiaomi: no COOL/WARM exclusion, only bail out on read errors */
 	rc = power_supply_get_property(chip->batt_psy,
 			POWER_SUPPLY_PROP_HEALTH, &prop);
-	if (!rc && (prop.intval == POWER_SUPPLY_HEALTH_COOL ||
-			prop.intval == POWER_SUPPLY_HEALTH_WARM))
+	if (rc < 0)
 		goto exit_soc_scale;
 
 	if (chip->last_fifo_i_ua >= 0)
@@ -379,8 +389,14 @@ exit_soc_scale:
 int qg_adjust_sys_soc(struct qpnp_qg *chip)
 {
 	int soc, vbat_uv, rc;
-	int vcutoff_uv = chip->dt.vbatt_cutoff_mv * 1000;
+	int vcutoff_uv;
 
+	if (IS_ERR_OR_NULL(chip)) {
+		pr_err("*chip of QG is not ready, rc = %d\n", (int)PTR_ERR(chip));
+		return -ENODEV;
+	}
+
+	vcutoff_uv = chip->dt.vbatt_cutoff_mv * 1000;
 	chip->sys_soc = CAP(QG_MIN_SOC, QG_MAX_SOC, chip->sys_soc);
 
 	/* TCSS */
@@ -555,6 +571,8 @@ static void update_msoc(struct qpnp_qg *chip)
 	rc = qg_sdam_write(SDAM_SOC, sdam_soc);
 	if (rc < 0)
 		pr_err("Failed to update SDAM with MSOC rc=%d\n", rc);
+	else
+		pr_err("SDAM_SOC:%d has been writed\n", chip->sdam_data[SDAM_SOC]);
 
 	if (!chip->dt.cl_disable && chip->cl->active) {
 		rc = qg_get_battery_temp(chip, &batt_temp);

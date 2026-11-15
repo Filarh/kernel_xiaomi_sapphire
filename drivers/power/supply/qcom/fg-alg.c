@@ -623,8 +623,8 @@ void cap_learning_update(struct cap_learning *cl, int batt_temp,
 		goto out;
 	}
 
-	pr_debug("Charge_status: %d active: %d batt_soc: %d\n",
-		charge_status, cl->active, batt_soc_cp);
+	pr_err("%s Charge_status: %d active: %d batt_soc: %d\n",
+		__func__, charge_status, cl->active, batt_soc_cp);
 
 	if (cl->active && cl->dt.cl_wt_enable)
 		cap_wt_learning_update(cl, batt_soc_cp, input_present);
