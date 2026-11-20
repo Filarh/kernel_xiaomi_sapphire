@@ -27,10 +27,13 @@ if [ "$VARIANT" = bakasu ]; then
   git -C "$WORK/susfs" checkout -q "$SUSFS_COMMIT"
   cp "$WORK/susfs/kernel_patches/fs/susfs.c" fs/
   cp "$WORK/susfs/kernel_patches/include/linux/susfs.h" "$WORK/susfs/kernel_patches/include/linux/susfs_def.h" include/linux/
-  if ! patch -p1 -N --no-backup-if-mismatch -r - < "$WORK/susfs/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch" | tee "$DIST/susfs-patch.log"; then
-    echo "::error::el parche de susfs no aplica limpio"; grep -nE "FAILED|rej|offset|fuzz" "$DIST/susfs-patch.log" || true; exit 1
-  fi
-  grep -nE "offset|fuzz" "$DIST/susfs-patch.log" || true
+  patch -p1 -N --no-backup-if-mismatch -r "$DIST/susfs.rej" < "$WORK/susfs/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch" > "$DIST/susfs-patch.log" || true
+  cat "$DIST/susfs-patch.log"
+  # Solo se aceptan los dos fallos conocidos (hunk 1 de includes en cada archivo)
+  FAILS=$(awk '/^patching file/{f=$3} /^Hunk #[0-9]+ FAILED/{printf "%s:%s ", f, $2}' "$DIST/susfs-patch.log")
+  EXPECTED="fs/namespace.c:#1 fs/proc/task_mmu.c:#1 "
+  if [ "$FAILS" != "$EXPECTED" ]; then echo "::error::fallos de susfs inesperados: $FAILS"; exit 1; fi
+  python3 "$ROOT/ci/susfs-fixup.py"
   # 2) BakaSU
   git clone -q https://github.com/Baka-SU/BakaSU.git KernelSU
   git -C KernelSU checkout -q "$BAKASU_COMMIT"
