@@ -31,10 +31,12 @@ if [ "$VARIANT" = bakasu ]; then
   cp "$WORK/susfs/kernel_patches/include/linux/susfs.h" "$WORK/susfs/kernel_patches/include/linux/susfs_def.h" include/linux/
   patch -p1 -N --no-backup-if-mismatch -r "$DIST/susfs.rej" < "$WORK/susfs/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch" > "$DIST/susfs-patch.log" || true
   cat "$DIST/susfs-patch.log"
-  # Solo se aceptan los dos fallos conocidos (hunk 1 de includes en cada archivo)
-  FAILS=$(awk '/^patching file/{f=$3} /^Hunk #[0-9]+ FAILED/{printf "%s:%s ", f, $2}' "$DIST/susfs-patch.log")
-  EXPECTED="fs/namespace.c:#1 fs/proc/task_mmu.c:#1 "
-  if [ "$FAILS" != "$EXPECTED" ]; then echo "::error::fallos de susfs inesperados: $FAILS"; exit 1; fi
+  # Solo se aceptan fallos en los hunks de includes que resuelve ci/susfs-fixup.py
+  # (en 5.15.194 fallan porque falta el include de trace/hooks de contexto; en 5.15.220 aplican)
+  ACEPTADOS=" fs/namespace.c:#1 fs/proc/task_mmu.c:#1 "
+  for f in $(awk '/^patching file/{f=$3} /^Hunk #[0-9]+ FAILED/{printf "%s:%s\n", f, $2}' "$DIST/susfs-patch.log"); do
+    case "$ACEPTADOS" in *" $f "*) echo "hunk resuelto por susfs-fixup: $f";; *) echo "::error::hunk de susfs que no aplica: $f"; exit 1;; esac
+  done
   python3 "$ROOT/ci/susfs-fixup.py"
   # 2) BakaSU
   git clone -q https://github.com/Baka-SU/BakaSU.git KernelSU
