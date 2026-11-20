@@ -2,7 +2,8 @@
 ## osm0sis @ xda-developers
 
 ### AnyKernel setup
-# global properties (kernel.string lo rellena ci/build.sh)
+# global properties (kernel.string lo rellena ci/package.sh). supported.versions es la versión de
+# Android y va vacía: la compatibilidad del kernel la decide kmicheck más abajo.
 properties() { '
 kernel.string=@KERNEL_STRING@
 do.devicecheck=1
@@ -13,7 +14,7 @@ do.cleanuponabort=0
 device.name1=sapphire
 device.name2=sapphiren
 device.name3=
-supported.versions=@KERNEL_MAJMIN@
+supported.versions=
 supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
