@@ -2,7 +2,9 @@
  * Misma regla que el kernel con CONFIG_MODVERSIONS (kernel/module.c: check_version,
  * same_magic): por cada símbolo de __versions, su CRC debe ser el de vmlinux.symvers;
  * los símbolos que vmlinux no exporta deben exportarlos otros módulos del conjunto.
- * Uso: kmicheck vmlinux.symvers DIR... ; sale 0 si todos son compatibles, 1 si no, 2 si error. */
+ * Uso: kmicheck vmlinux.symvers DIR... ; sale 0 si todos son compatibles, 1 si no, 2 si error.
+ *      kmicheck -r DIR...  ; imprime la versión (primer campo de vermagic) de los módulos;
+ *                            sale 1 si hay más de una distinta. */
 #include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -58,7 +60,27 @@ static void walk(const char *dir) {
   closedir(dp);
 }
 
+static int release_mode(int argc, char **argv) {
+  for (int i = 2; i < argc; i++) walk(argv[i]);
+  char *rel = NULL; int varias = 0;
+  for (size_t k = 0; k < nkos; k++) {
+    size_t n; unsigned char *d = slurp(kos[k], &n); uint64_t sz;
+    const unsigned char *m = d ? sec(d, n, ".modinfo", &sz) : NULL;
+    for (uint64_t o = 0; m && o < sz; o += strlen((const char *)m + o) + 1) {
+      if (strncmp((const char *)m + o, "vermagic=", 9)) continue;
+      const char *v = (const char *)m + o + 9; size_t l = strcspn(v, " ");
+      if (!rel) { rel = strndup(v, l); }
+      else if (strlen(rel) != l || strncmp(rel, v, l)) varias = 1;
+    }
+    free(d);
+  }
+  if (!rel) { fprintf(stderr, "sin vermagic en los módulos\n"); return 2; }
+  printf("%s\n", rel);
+  return varias;
+}
+
 int main(int argc, char **argv) {
+  if (argc >= 3 && !strcmp(argv[1], "-r")) return release_mode(argc, argv);
   if (argc < 3) { fprintf(stderr, "uso: %s vmlinux.symvers DIR...\n", argv[0]); return 2; }
   size_t n; char *sv = (char *)slurp(argv[1], &n);
   if (!sv) { fprintf(stderr, "no se puede leer %s\n", argv[1]); return 2; }

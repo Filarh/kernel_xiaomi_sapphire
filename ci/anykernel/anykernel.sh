@@ -55,12 +55,26 @@ case "$kmi_dirs" in
      abort "No se encuentra vendor_dlkm para comprobar la compatibilidad de módulos. Abortado.";;
 esac;
 chmod 755 $AKHOME/tools/kmicheck;
-ui_print " " "Comprobando módulos de la ROM contra este kernel...";
-$AKHOME/tools/kmicheck $AKHOME/vmlinux.symvers $kmi_dirs > $AKHOME/kmicheck.log 2>&1;
-kmi_rc=$?;
-while read -r l; do ui_print "$l"; done < $AKHOME/kmicheck.log;
+
+# Elección del kernel: kernels/lista trae los Image del zip, del más nuevo al más viejo.
+# 1) el compilado del mismo código que la ROM (su versión = la del vermagic de los módulos);
+# 2) si no está, el primero compatible por CRC; 3) si ninguno, abortar.
+rom_rel=$($AKHOME/tools/kmicheck -r $kmi_dirs 2>/dev/null);
+ui_print " " "Módulos de la ROM: ${rom_rel:-desconocido}";
+elegido="";
+for k in $rom_rel $(cat $AKHOME/kernels/lista); do
+  [ -f "$AKHOME/kernels/$k/Image" ] || continue;
+  ui_print "Probando kernel $k...";
+  if $AKHOME/tools/kmicheck $AKHOME/kernels/$k/vmlinux.symvers $kmi_dirs > $AKHOME/kmicheck.log 2>&1; then
+    elegido=$k;
+  fi;
+  while read -r l; do ui_print "  $l"; done < $AKHOME/kmicheck.log;
+  [ "$elegido" ] && break;
+done;
 for m in $kmi_montados; do umount $m; done;
-[ $kmi_rc -eq 0 ] || abort "Los módulos de esta ROM no son compatibles con este kernel. Abortado.";
+[ "$elegido" ] || abort "Ningún kernel del zip es compatible con los módulos de esta ROM. Abortado.";
+ui_print " " "Instalando kernel $elegido";
+cp -f $AKHOME/kernels/$elegido/Image $AKHOME/Image;
 
 # boot install: solo se reemplaza el kernel (boot v4 sin ramdisk; el ramdisk va en init_boot)
 split_boot;
