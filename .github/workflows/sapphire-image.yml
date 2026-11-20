@@ -1,0 +1,29 @@
+name: sapphire Image (base vs BakaSU+susfs)
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, bakasu]
+    steps:
+      - name: Liberar disco
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Dependencias
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio lz4 dwarves python3
+      - name: Compilar
+        run: ci/build.sh ${{ matrix.variant }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sapphire-${{ matrix.variant }}
+          path: dist/${{ matrix.variant }}
+          retention-days: 14
