@@ -17,8 +17,10 @@ mkdir -p "$DIST"
 # Toolchain: clang r547379 de AOSP (el mismo que TARGET_KERNEL_CLANG_VERSION)
 if [ ! -x "$WORK/clang/bin/clang" ]; then
   mkdir -p "$WORK/clang"
-  curl -fsSL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$CLANG_COMMIT/clang-r547379.tar.gz" \
-    | tar -xz -C "$WORK/clang"
+  # googlesource responde a veces 503: reintentos con espera antes de dar el build por fallido
+  curl -fsSL --retry 8 --retry-delay 15 --retry-all-errors -o "$WORK/clang.tar.gz" \
+    "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/$CLANG_COMMIT/clang-r547379.tar.gz"
+  tar -xzf "$WORK/clang.tar.gz" -C "$WORK/clang" && rm -f "$WORK/clang.tar.gz"
 fi
 export PATH="$WORK/clang/bin:$PATH"
 clang --version | head -1
