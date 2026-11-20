@@ -26,11 +26,13 @@ MAJMIN=$(cut -d. -f1,2 "$WORK/kernels/lista" | sort -u)
 BAKASU=$(grep -h -m1 -o 'BakaSU version name: .*' "${LISTOS[0]}/build.log" | cut -d' ' -f4)
 SUSFS=$(grep -h -m1 -o 'SUSFS_VERSION: .*' "${LISTOS[0]}/build.log" | cut -d' ' -f2)
 KLIST=$(paste -sd, "$WORK/kernels/lista")
-sed -e "s|@KERNEL_STRING@|sapphire BakaSU $BAKASU + susfs $SUSFS ($KLIST)|" -e "s|@KERNEL_MAJMIN@|$MAJMIN|" \
+DS=""; grep -q "^CONFIG_SYSVIPC=y" "${LISTOS[0]}/config.txt" && DS=" + Droidspaces"
+sed -e "s|@KERNEL_STRING@|sapphire BakaSU $BAKASU + susfs $SUSFS$DS ($KLIST)|" -e "s|@KERNEL_MAJMIN@|$MAJMIN|" \
   "$ROOT/ci/anykernel/anykernel.sh" > "$WORK/anykernel.sh"
 aarch64-linux-gnu-gcc -O2 -static -Wall -o "$WORK/tools/kmicheck" "$ROOT/ci/kmicheck.c"
 aarch64-linux-gnu-strip "$WORK/tools/kmicheck"
-NAME="sapphire-bakasu-$BAKASU-susfs-$SUSFS-AnyKernel3.zip"
+EXTRA=""; grep -q "^CONFIG_SYSVIPC=y" "${LISTOS[0]}/config.txt" && EXTRA="-droidspaces"
+NAME="sapphire-bakasu-$BAKASU-susfs-$SUSFS$EXTRA-AnyKernel3.zip"
 (cd "$WORK" && zip -qr9 "$OUTDIR/$NAME" . -x '.*')
 cat "$WORK/kernels/lista"
 (cd "$OUTDIR" && sha256sum "$NAME" | tee "$NAME.sha256")

@@ -8,6 +8,13 @@ BASE_COMMIT=$(cat ci/base-commit)
 CLANG_COMMIT=9916fb51ccb914d62d35ad9a7b9b21d2ef046928   # android16-qpr2-release: clang-r547379 build 13290119, el mismo que compiló el kernel instalado
 SUSFS_COMMIT=c1d1da42b74771944207ec45aaceff9c57e84985    # simonpunk/susfs4ksu gki-android13-5.15
 BAKASU_COMMIT=7b65bde0710b5e7c6f755545cb15a4abd417f3a8   # Baka-SU/BakaSU main
+DROIDSPACES_COMMIT=cdadb9eb5d0f86aacffff60776333e6f6b73a30a   # ravindu644/Droidspaces-OSS
+# Parche kABI para GKI 5.4–6.6 que su documentación indica primero (Kernel-Configuration.md, "GKI kernels")
+DROIDSPACES_KABI=Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+# Opciones de su lista GKI ("Do not turn on anything beyond them"): obligatorias + opcionales recomendadas
+DROIDSPACES_CONFIG="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE
+  USER_NS IP6_NF_NAT IP6_NF_TARGET_MASQUERADE MACVLAN IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT
+  NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
 ROOT="$PWD"
 WORK="${RUNNER_TEMP:-/tmp}"
 OUT="$ROOT/out"
@@ -25,7 +32,7 @@ fi
 export PATH="$WORK/clang/bin:$PATH"
 clang --version | head -1
 
-if [ "$VARIANT" = bakasu ]; then
+if [ "$VARIANT" = bakasu ] || [ "$VARIANT" = bakasu-ds ]; then
   # 1) susfs, parte de kernel
   git clone -q https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android13-5.15 "$WORK/susfs"
   git -C "$WORK/susfs" checkout -q "$SUSFS_COMMIT"
@@ -48,6 +55,14 @@ if [ "$VARIANT" = bakasu ]; then
   grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 fi
 
+if [ "$VARIANT" = bakasu-ds ]; then
+  git clone -q --filter=blob:none https://github.com/ravindu644/Droidspaces-OSS.git "$WORK/droidspaces"
+  git -C "$WORK/droidspaces" checkout -q "$DROIDSPACES_COMMIT"
+  patch -p1 -N --no-backup-if-mismatch --dry-run < "$WORK/droidspaces/$DROIDSPACES_KABI" > "$DIST/droidspaces-patch.log" \
+    || { cat "$DIST/droidspaces-patch.log"; echo "::error::el parche kABI de Droidspaces no aplica limpio"; exit 1; }
+  patch -p1 -N --no-backup-if-mismatch < "$WORK/droidspaces/$DROIDSPACES_KABI" | tee "$DIST/droidspaces-patch.log"
+fi
+
 MAKE=(make -j"$(nproc)" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1
       CROSS_COMPILE=aarch64-linux-gnu- BOARD_PLATFORM=bengal
       KCFLAGS="-D__ANDROID_COMMON_KERNEL__ -Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=enum-conversion -Wno-error=shift-count-overflow -Wno-error=constant-conversion"
@@ -55,16 +70,22 @@ MAKE=(make -j"$(nproc)" O="$OUT" ARCH=arm64 LLVM=1 LLVM_IAS=1
 
 "${MAKE[@]}" vendor/sapphire_defconfig
 scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO --set-str LOCALVERSION ""
-if [ "$VARIANT" = bakasu ]; then
+if [ "$VARIANT" = bakasu ] || [ "$VARIANT" = bakasu-ds ]; then
   scripts/config --file "$OUT/.config" -e KSU -d KSU_DEBUG \
     -d KSU_TRACEPOINT_HOOK -d KSU_MANUAL_HOOK -e KSU_SUSFS \
     -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
     -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
     -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP
 fi
+if [ "$VARIANT" = bakasu-ds ]; then
+  for c in $DROIDSPACES_CONFIG; do scripts/config --file "$OUT/.config" -e "$c"; done
+fi
 "${MAKE[@]}" olddefconfig
 grep -E '^(# )?CONFIG_(KSU|LOCALVERSION)' "$OUT/.config" || true
-if [ "$VARIANT" = bakasu ]; then
+if [ "$VARIANT" = bakasu-ds ]; then
+  for c in $DROIDSPACES_CONFIG; do grep -q "^CONFIG_$c=y" "$OUT/.config" || { echo "::error::CONFIG_$c no quedó en y"; exit 1; }; done
+fi
+if [ "$VARIANT" = bakasu ] || [ "$VARIANT" = bakasu-ds ]; then
   for c in KSU KSU_SUSFS; do grep -q "^CONFIG_$c=y" "$OUT/.config" || { echo "::error::CONFIG_$c no quedó en y"; exit 1; }; done
 fi
 
