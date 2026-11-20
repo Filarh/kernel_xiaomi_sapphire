@@ -24,20 +24,43 @@ for l in open(symvers_p):
 types, _ = btflib.load_base(image)
 lay = btflib.layouts(types)
 
+def rangos(sz, ms):
+    """(nombre, inicio, fin, tipo) en bits; el fin es el offset del siguiente miembro distinto
+    (o el final de la estructura). Los miembros de una unión comparten offset."""
+    offs = sorted({m[1] for m in ms}) + [sz * 8]
+    return [(m[0], m[1], next((o for o in offs if o > m[1]), m[1]), m[2]) for m in ms]
+
 def layout_ok(ref_layouts, new_layouts):
-    """True si cada layout de la ROM tiene un layout igual en el kernel, o uno que solo se diferencia
-    en miembros android_kabi_reservedN sustituidos en el mismo offset (ANDROID_KABI_USE)."""
+    """True si cada layout de la ROM tiene en el kernel uno del mismo tamaño en el que:
+    - todo miembro de la ROM que no es un hueco android_kabi_reservedN sigue con el mismo
+      nombre, offset y tipo;
+    - todo miembro nuevo cae entero dentro de bytes que en la ROM eran huecos
+      android_kabi_reservedN (ANDROID_KABI_USE / _ANDROID_KABI_REPLACE).
+    Así los módulos de la ROM, que no leen los huecos, ven las mismas posiciones."""
     for rsz, rms in ref_layouts:
         ok = False
+        r = rangos(rsz, rms)
+        fijos = {(n, i, t) for n, i, f, t in r if not n.startswith('android_kabi_reserved')}
+        huecos = [(i, f) for n, i, f, t in r if n.startswith('android_kabi_reserved')]
         for nsz, nms in new_layouts:
             if nsz != rsz: continue
-            nms = [tuple(m[:2]) + (m[2],) for m in nms]; rms_t = [tuple(m) for m in rms]
-            if nms == rms_t: ok = True; break
-            if len(nms) != len(rms_t): continue
-            if all(a == b or (a[0].startswith('android_kabi_reserved') and a[1] == b[1]) for a, b in zip(rms_t, nms)):
+            nr = rangos(nsz, nms)
+            nuevos = {(n, i, t) for n, i, f, t in nr}
+            if not fijos <= nuevos: continue
+            extra = [(i, f) for n, i, f, t in nr if (n, i, t) not in fijos and not n.startswith('android_kabi_reserved')]
+            if all(any(hi <= i and f <= hf for hi, hf in huecos) or
+                   (any(hi <= i < hf for hi, hf in huecos) and contiguo(huecos, i, f)) for i, f in extra):
                 ok = True; break
         if not ok: return False
     return True
+
+def contiguo(huecos, i, f):
+    """True si [i, f) está cubierto por huecos reservados adyacentes (p. ej. 7 y 8 juntos)."""
+    pos = i
+    for hi, hf in sorted(huecos):
+        if hi <= pos < hf: pos = hf
+        if pos >= f: return True
+    return pos >= f
 
 ok_roms = []; propia_falla = False
 for f in sorted(os.listdir(roms)):
