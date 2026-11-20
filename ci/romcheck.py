@@ -8,7 +8,7 @@ rama (5.15), y además:
      porque los módulos de la ROM no leen ese hueco.
 Un kernel más viejo que la ROM no se admite: sus módulos pueden usar huecos que ese kernel no rellena.
 Uso: romcheck.py Image vmlinux.symvers DIR_ROMS   -> imprime la matriz y escribe 'roms-ok' al lado del Image
-Sale 1 si el kernel no sirve para la ROM de su mismo código cuando está registrada."""
+Sale 1 si el kernel no sirve para la ROM de su mismo código cuando está registrada, o para ninguna."""
 import json, os, re, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import btflib
@@ -86,4 +86,6 @@ for f in sorted(os.listdir(roms)):
     elif rrel == krel: propia_falla = True
 with open(os.path.join(os.path.dirname(image), 'roms-ok'), 'w') as fh:
     fh.write(''.join(r + '\n' for r in ok_roms))
-sys.exit(1 if propia_falla else 0)
+# Un kernel que no sirve ni para su propia ROM, o para ninguna ROM registrada, no entra al zip:
+# para ROM sin referencia solo se comprobarían CRC, y aquí ya se vio que su layout no cuadra.
+sys.exit(1 if propia_falla or not ok_roms else 0)
