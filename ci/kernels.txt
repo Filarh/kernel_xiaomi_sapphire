@@ -1,0 +1,5 @@
+# Commits de The-Angel-Place-Sapphire/kernel_xiaomi_sapphire que llevan ROM publicadas.
+# El workflow añade solo la punta de lineage-23.2. Para registrar una ROM nueva:
+#   ci/registrar-rom.sh <rom.zip>   (lee la versión del kernel de su boot.img)
+3a2cfe72b3b05983f7b5594094f9572b38c36c04  # 5.15.194, Lunaris 3.13 2026111612
+097cabf8b0a961e3cd2bc9ad9a08168a6088d0ff  # 5.15.220, Lunaris 3.13 2026111709

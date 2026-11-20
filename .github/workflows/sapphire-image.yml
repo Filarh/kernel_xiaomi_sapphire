@@ -3,23 +3,43 @@ on:
   push:
     branches: ['ci/**']
   workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'   # a diario: compila si Angel movió lineage-23.2 o cambió ci/kernels.txt
 jobs:
+  matriz:
+    runs-on: ubuntu-24.04
+    outputs:
+      bases: ${{ steps.m.outputs.bases }}
+      clave: ${{ steps.m.outputs.clave }}
+      hecho: ${{ steps.c.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: m
+        run: ci/matriz.sh
+      - id: c
+        uses: actions/cache/restore@v4
+        with:
+          path: hecho.txt
+          key: zip-${{ steps.m.outputs.clave }}
+          lookup-only: true
   build:
+    needs: matriz
+    if: github.event_name != 'schedule' || needs.matriz.outputs.hecho != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        # Commits de Angel (kernel_xiaomi_sapphire) que llevan las ROM publicadas
-        base:
-          - 3a2cfe72b3b05983f7b5594094f9572b38c36c04   # 5.15.194, Lunaris 3.13 2026111612
-          - 097cabf8b0a961e3cd2bc9ad9a08168a6088d0ff   # 5.15.220, Lunaris 3.13 2026111709
+        base: ${{ fromJSON(needs.matriz.outputs.bases) }}
     steps:
       - name: Liberar disco
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
-      - name: Código del kernel
+      - name: Código del kernel (Angel)
         uses: actions/checkout@v4
         with:
+          repository: The-Angel-Place-Sapphire/kernel_xiaomi_sapphire
           ref: ${{ matrix.base }}
           fetch-depth: 1
       - name: Scripts de CI
@@ -41,7 +61,8 @@ jobs:
           path: dist/bakasu
           retention-days: 14
   package:
-    needs: build
+    needs: [matriz, build]
+    if: always() && needs.build.result != 'skipped' && needs.build.result != 'cancelled'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -61,3 +82,8 @@ jobs:
           name: sapphire-bakasu-anykernel3
           path: zip
           retention-days: 30
+      - run: date -u > hecho.txt
+      - uses: actions/cache/save@v4
+        with:
+          path: hecho.txt
+          key: zip-${{ needs.matriz.outputs.clave }}
