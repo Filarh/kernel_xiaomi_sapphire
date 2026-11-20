@@ -3,7 +3,7 @@
 set -euo pipefail
 VARIANT="$1"
 KREL_EXPECTED="5.15.194-g3a2cfe72b3b0"   # versión del kernel instalado (uname -r)
-CLANG_COMMIT=70a12c4fe88940ab2b0e6d763492dffa2f07e15a
+CLANG_COMMIT=9916fb51ccb914d62d35ad9a7b9b21d2ef046928   # android16-qpr2-release: clang-r547379 build 13290119, el mismo que compiló el kernel instalado
 SUSFS_COMMIT=c1d1da42b74771944207ec45aaceff9c57e84985    # simonpunk/susfs4ksu gki-android13-5.15
 BAKASU_COMMIT=7b65bde0710b5e7c6f755545cb15a4abd417f3a8   # Baka-SU/BakaSU main
 ROOT="$PWD"
@@ -69,6 +69,7 @@ KREL=$(cat "$OUT/include/config/kernel.release")
 echo "kernel.release = $KREL"
 [ "$KREL" = "$KREL_EXPECTED" ] || { echo "::error::kernel.release $KREL != $KREL_EXPECTED"; exit 1; }
 
-cp "$OUT/arch/arm64/boot/Image" "$OUT/.config" "$OUT/vmlinux.symvers" "$OUT/System.map" "$DIST/"
-strings "$OUT/arch/arm64/boot/Image" | grep -m1 "Linux version" > "$DIST/version.txt"
+cp "$OUT/.config" "$DIST/config.txt"
+cp "$OUT/arch/arm64/boot/Image" "$OUT/vmlinux.symvers" "$OUT/System.map" "$DIST/"
+grep -a -m1 -o "Linux version 5[^\n]*" "$OUT/arch/arm64/boot/Image" | head -c 400 > "$DIST/version.txt"
 sha256sum "$DIST"/Image | tee "$DIST/Image.sha256"
