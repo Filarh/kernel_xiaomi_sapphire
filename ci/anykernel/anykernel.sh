@@ -49,6 +49,13 @@ for p in vendor_dlkm system_dlkm; do
     fi;
   done;
 done;
+# Módulos del ramdisk de vendor_boot: en recovery están en /lib/modules; en Android ya están
+# cargados y sus símbolos salen en /proc/kallsyms (con [módulo]).
+[ -d /lib/modules ] && kmi_dirs="$kmi_dirs /lib/modules";
+kmi_x="";
+if grep -q '\[' /proc/kallsyms 2>/dev/null; then
+  grep '\[' /proc/kallsyms > $AKHOME/kallsyms-modulos 2>/dev/null && kmi_x="-x $AKHOME/kallsyms-modulos";
+fi;
 case "$kmi_dirs" in
   *vendor_dlkm*) ;;
   *) for m in $kmi_montados; do umount $m; done;
@@ -63,19 +70,19 @@ chmod 755 $AKHOME/tools/kmicheck;
 # 2) ROM desconocida: kernels de su rama y más nuevos que ella, del más cercano al más nuevo,
 #    con los CRC de sus módulos (kmicheck); el layout no se puede comprobar sin su referencia.
 rom_rel=$($AKHOME/tools/kmicheck -r $kmi_dirs 2>/dev/null);
-ui_print " " "Módulos de la ROM: ${rom_rel:-desconocido}";
+ui_print " " "Módulos de vendor compilados para: ${rom_rel:-desconocido}";
 registrada="";
 grep -qx "$rom_rel" $AKHOME/kernels/roms-registradas 2>/dev/null && registrada=1;
 candidatos="";
 if [ "$registrada" ]; then
-  ui_print "ROM registrada: se usan kernels verificados para ella";
+  ui_print "Módulos con referencia en el CI: kernels verificados (CRC + layout)";
   grep -qx "$rom_rel" $AKHOME/kernels/$rom_rel/roms-ok 2>/dev/null && candidatos=$rom_rel;
   for k in $(cat $AKHOME/kernels/lista); do
     [ "$k" = "$rom_rel" ] && continue;
     grep -qx "$rom_rel" $AKHOME/kernels/$k/roms-ok && candidatos="$candidatos $k";
   done;
 elif [ "$rom_rel" ]; then
-  ui_print "ROM no registrada: solo kernels de su rama y más nuevos";
+  ui_print "Módulos sin referencia: regla KMI de GKI (misma rama, igual o más nuevo, CRC iguales)";
   for k in $(sed '1!G;h;$!d' $AKHOME/kernels/lista); do
     $AKHOME/tools/kmicheck -ge "$k" "$rom_rel" && candidatos="$candidatos $k";
   done;
@@ -83,14 +90,14 @@ fi;
 elegido="";
 for k in $candidatos; do
   ui_print "Probando kernel $k...";
-  if $AKHOME/tools/kmicheck $AKHOME/kernels/$k/vmlinux.symvers $kmi_dirs > $AKHOME/kmicheck.log 2>&1; then
+  if $AKHOME/tools/kmicheck $kmi_x $AKHOME/kernels/$k/vmlinux.symvers $kmi_dirs > $AKHOME/kmicheck.log 2>&1; then
     elegido=$k;
   fi;
   while read -r l; do ui_print "  $l"; done < $AKHOME/kmicheck.log;
   [ "$elegido" ] && break;
 done;
 for m in $kmi_montados; do umount $m; done;
-[ "$elegido" ] || abort "Ningún kernel del zip es compatible con los módulos de esta ROM. Abortado.";
+[ "$elegido" ] || abort "Ningún kernel del zip es compatible con la KMI de los módulos de vendor instalados. Abortado.";
 ui_print " " "Instalando kernel $elegido";
 cp -f $AKHOME/kernels/$elegido/Image $AKHOME/Image;
 

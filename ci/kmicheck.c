@@ -2,9 +2,11 @@
  * Misma regla que el kernel con CONFIG_MODVERSIONS (kernel/module.c: check_version,
  * same_magic): por cada símbolo de __versions, su CRC debe ser el de vmlinux.symvers;
  * los símbolos que vmlinux no exporta deben exportarlos otros módulos del conjunto.
- * Uso: kmicheck vmlinux.symvers DIR... ; sale 0 si todos son compatibles, 1 si no, 2 si error.
- *      kmicheck -r DIR...  ; imprime la versión (primer campo de vermagic) de los módulos;
- *                            sale 1 si hay más de una distinta.
+ * Uso: kmicheck [-x EXPORTS] vmlinux.symvers DIR... ; sale 0 si todos son compatibles, 1 si no, 2 si error.
+ *      -x EXPORTS: símbolos que exportan módulos que no están en DIR (p. ej. los del ramdisk de
+ *      vendor_boot ya cargados): una línea por símbolo, o el formato de /proc/kallsyms, del que se
+ *      toman los símbolos de módulos (los que llevan [módulo] al final).
+ *      kmicheck -r DIR...  ; imprime la versión más alta (primer campo de vermagic) de los módulos.
  *      kmicheck -ge A B    ; sale 0 si la versión A (x.y.z…) es mayor o igual que B en la misma
  *                            rama x.y, 1 si es menor, 2 si son de ramas distintas. */
 #include <dirent.h>
@@ -62,23 +64,32 @@ static void walk(const char *dir) {
   closedir(dp);
 }
 
+static int vercmp(const char *a, const char *b) {
+  unsigned va[3] = {0}, vb[3] = {0};
+  sscanf(a, "%u.%u.%u", &va[0], &va[1], &va[2]); sscanf(b, "%u.%u.%u", &vb[0], &vb[1], &vb[2]);
+  for (int i = 0; i < 3; i++) if (va[i] != vb[i]) return va[i] < vb[i] ? -1 : 1;
+  return 0;
+}
+
+/* Imprime la versión más alta (primer campo de vermagic) entre los módulos: es la que más
+ * exige al kernel, porque un módulo puede usar huecos KABI que solo rellena un kernel igual o
+ * más nuevo que aquel para el que se compiló. */
 static int release_mode(int argc, char **argv) {
   for (int i = 2; i < argc; i++) walk(argv[i]);
-  char *rel = NULL; int varias = 0;
+  char *rel = NULL;
   for (size_t k = 0; k < nkos; k++) {
     size_t n; unsigned char *d = slurp(kos[k], &n); uint64_t sz;
     const unsigned char *m = d ? sec(d, n, ".modinfo", &sz) : NULL;
     for (uint64_t o = 0; m && o < sz; o += strlen((const char *)m + o) + 1) {
       if (strncmp((const char *)m + o, "vermagic=", 9)) continue;
-      const char *v = (const char *)m + o + 9; size_t l = strcspn(v, " ");
-      if (!rel) { rel = strndup(v, l); }
-      else if (strlen(rel) != l || strncmp(rel, v, l)) varias = 1;
+      const char *v = (const char *)m + o + 9; char *c = strndup(v, strcspn(v, " "));
+      if (!rel || vercmp(c, rel) > 0) { free(rel); rel = c; } else free(c);
     }
     free(d);
   }
   if (!rel) { fprintf(stderr, "sin vermagic en los módulos\n"); return 2; }
   printf("%s\n", rel);
-  return varias;
+  return 0;
 }
 
 static int ge_mode(const char *a, const char *b) {
@@ -88,9 +99,30 @@ static int ge_mode(const char *a, const char *b) {
   return va[2] >= vb[2] ? 0 : 1;
 }
 
+static void add_exp(char *name) {
+  if (nexp == cexp) exp_ = realloc(exp_, (cexp = cexp ? cexp * 2 : 1024) * sizeof *exp_);
+  exp_[nexp++] = name;
+}
+
+static int load_extra(const char *path) {
+  size_t n; char *b = (char *)slurp(path, &n);
+  if (!b) { fprintf(stderr, "no se puede leer %s\n", path); return -1; }
+  for (char *line = strtok(b, "\n"); line; line = strtok(NULL, "\n")) {
+    char *tok[4] = {0}; int nt = 0;
+    for (char *t = strtok_r(line, " \t", &line); t && nt < 4; t = strtok_r(NULL, " \t", &line)) tok[nt++] = t;
+    if (nt == 1) add_exp(tok[0]);
+    else if (nt == 4 && tok[3][0] == '[') add_exp(tok[2]);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 4 && !strcmp(argv[1], "-ge")) return ge_mode(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "-r")) return release_mode(argc, argv);
+  if (argc >= 5 && !strcmp(argv[1], "-x")) {
+    if (load_extra(argv[2])) return 2;
+    argv += 2; argc -= 2;
+  }
   if (argc < 3) { fprintf(stderr, "uso: %s vmlinux.symvers DIR...\n", argv[0]); return 2; }
   size_t n; char *sv = (char *)slurp(argv[1], &n);
   if (!sv) { fprintf(stderr, "no se puede leer %s\n", argv[1]); return 2; }
@@ -108,7 +140,7 @@ int main(int argc, char **argv) {
     data[k] = slurp(kos[k], &len[k]);
     uint64_t sz; const unsigned char *s = data[k] ? sec(data[k], len[k], "__ksymtab_strings", &sz) : NULL;
     for (uint64_t o = 0; s && o < sz; o += strlen((const char *)s + o) + 1)
-      if (s[o]) { if (nexp == cexp) exp_ = realloc(exp_, (cexp = cexp ? cexp * 2 : 1024) * sizeof *exp_); exp_[nexp++] = (char *)s + o; }
+      if (s[o]) add_exp((char *)s + o);
   }
   qsort(exp_, nexp, sizeof *exp_, cmpstr);
   size_t malos = 0, entradas = 0;
