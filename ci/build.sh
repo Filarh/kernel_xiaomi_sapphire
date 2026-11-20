@@ -78,4 +78,6 @@ cp "$OUT/.config" "$DIST/config.txt"
 echo "$KREL" > "$DIST/kernel.release"
 cp "$OUT/arch/arm64/boot/Image" "$OUT/vmlinux.symvers" "$OUT/System.map" "$DIST/"
 grep -a -m1 -o "Linux version 5[^\n]*" "$OUT/arch/arm64/boot/Image" | head -c 400 > "$DIST/version.txt"
-sha256sum "$DIST"/Image | tee "$DIST/Image.sha256"
+(cd "$DIST" && sha256sum Image | tee Image.sha256)
+# Compatibilidad con cada ROM registrada (CRC + layout de las estructuras que usan sus módulos)
+python3 "$ROOT/ci/romcheck.py" "$DIST/Image" "$DIST/vmlinux.symvers" "$ROOT/ci/roms" | tee "$DIST/romcheck.txt"

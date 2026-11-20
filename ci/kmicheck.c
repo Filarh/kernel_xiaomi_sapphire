@@ -4,7 +4,9 @@
  * los símbolos que vmlinux no exporta deben exportarlos otros módulos del conjunto.
  * Uso: kmicheck vmlinux.symvers DIR... ; sale 0 si todos son compatibles, 1 si no, 2 si error.
  *      kmicheck -r DIR...  ; imprime la versión (primer campo de vermagic) de los módulos;
- *                            sale 1 si hay más de una distinta. */
+ *                            sale 1 si hay más de una distinta.
+ *      kmicheck -ge A B    ; sale 0 si la versión A (x.y.z…) es mayor o igual que B en la misma
+ *                            rama x.y, 1 si es menor, 2 si son de ramas distintas. */
 #include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -79,7 +81,15 @@ static int release_mode(int argc, char **argv) {
   return varias;
 }
 
+static int ge_mode(const char *a, const char *b) {
+  unsigned va[3] = {0}, vb[3] = {0};
+  if (sscanf(a, "%u.%u.%u", &va[0], &va[1], &va[2]) < 2 || sscanf(b, "%u.%u.%u", &vb[0], &vb[1], &vb[2]) < 2) return 2;
+  if (va[0] != vb[0] || va[1] != vb[1]) return 2;
+  return va[2] >= vb[2] ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 4 && !strcmp(argv[1], "-ge")) return ge_mode(argv[2], argv[3]);
   if (argc >= 3 && !strcmp(argv[1], "-r")) return release_mode(argc, argv);
   if (argc < 3) { fprintf(stderr, "uso: %s vmlinux.symvers DIR...\n", argv[0]); return 2; }
   size_t n; char *sv = (char *)slurp(argv[1], &n);

@@ -56,14 +56,32 @@ case "$kmi_dirs" in
 esac;
 chmod 755 $AKHOME/tools/kmicheck;
 
-# Elección del kernel: kernels/lista trae los Image del zip, del más nuevo al más viejo.
-# 1) el compilado del mismo código que la ROM (su versión = la del vermagic de los módulos);
-# 2) si no está, el primero compatible por CRC; 3) si ninguno, abortar.
+# Elección del kernel (regla GKI: mismo código o más nuevo, nunca más viejo que la ROM).
+# kernels/lista: los Image del zip, del más nuevo al más viejo. kernels/<rel>/roms-ok: ROM para las
+# que el CI comprobó CRC y layout de las estructuras que usan sus módulos (ci/romcheck.py).
+# 1) ROM registrada: solo kernels cuyo roms-ok la incluye; primero el del mismo código.
+# 2) ROM desconocida: kernels de su rama y más nuevos que ella, del más cercano al más nuevo,
+#    con los CRC de sus módulos (kmicheck); el layout no se puede comprobar sin su referencia.
 rom_rel=$($AKHOME/tools/kmicheck -r $kmi_dirs 2>/dev/null);
 ui_print " " "Módulos de la ROM: ${rom_rel:-desconocido}";
+registrada="";
+grep -qx "$rom_rel" $AKHOME/kernels/roms-registradas 2>/dev/null && registrada=1;
+candidatos="";
+if [ "$registrada" ]; then
+  ui_print "ROM registrada: se usan kernels verificados para ella";
+  grep -qx "$rom_rel" $AKHOME/kernels/$rom_rel/roms-ok 2>/dev/null && candidatos=$rom_rel;
+  for k in $(cat $AKHOME/kernels/lista); do
+    [ "$k" = "$rom_rel" ] && continue;
+    grep -qx "$rom_rel" $AKHOME/kernels/$k/roms-ok && candidatos="$candidatos $k";
+  done;
+elif [ "$rom_rel" ]; then
+  ui_print "ROM no registrada: solo kernels de su rama y más nuevos";
+  for k in $(sed '1!G;h;$!d' $AKHOME/kernels/lista); do
+    $AKHOME/tools/kmicheck -ge "$k" "$rom_rel" && candidatos="$candidatos $k";
+  done;
+fi;
 elegido="";
-for k in $rom_rel $(cat $AKHOME/kernels/lista); do
-  [ -f "$AKHOME/kernels/$k/Image" ] || continue;
+for k in $candidatos; do
   ui_print "Probando kernel $k...";
   if $AKHOME/tools/kmicheck $AKHOME/kernels/$k/vmlinux.symvers $kmi_dirs > $AKHOME/kmicheck.log 2>&1; then
     elegido=$k;

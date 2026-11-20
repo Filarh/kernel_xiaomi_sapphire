@@ -14,11 +14,13 @@ for d in "$@"; do
   LISTOS+=("$d")
   krel=$(cat "$d/kernel.release")
   mkdir -p "$WORK/kernels/$krel"
-  cp "$d/Image" "$d/vmlinux.symvers" "$WORK/kernels/$krel/"
+  cp "$d/Image" "$d/vmlinux.symvers" "$d/roms-ok" "$WORK/kernels/$krel/"
   echo "$krel" >> "$WORK/kernels/lista"
 done
 [ ${#LISTOS[@]} -gt 0 ] || { echo "::error::ningún build terminó"; exit 1; }
 sort -V -r -o "$WORK/kernels/lista" "$WORK/kernels/lista"
+# ROM con referencia en ci/roms: para ellas solo valen kernels que pasaron ci/romcheck.py
+ls "$ROOT/ci/roms" | sed -n 's/\.layout\.json$//p' | sort -V > "$WORK/kernels/roms-registradas"
 MAJMIN=$(cut -d. -f1,2 "$WORK/kernels/lista" | sort -u)
 [ "$(echo "$MAJMIN" | wc -l)" -eq 1 ] || { echo "::error::kernels de distintas ramas: $MAJMIN"; exit 1; }
 BAKASU=$(grep -h -m1 -o 'BakaSU version name: .*' "${LISTOS[0]}/build.log" | cut -d' ' -f4)
@@ -31,4 +33,5 @@ aarch64-linux-gnu-strip "$WORK/tools/kmicheck"
 NAME="sapphire-bakasu-$BAKASU-susfs-$SUSFS-AnyKernel3.zip"
 (cd "$WORK" && zip -qr9 "$OUTDIR/$NAME" . -x '.*')
 cat "$WORK/kernels/lista"
-sha256sum "$OUTDIR/$NAME" | tee "$OUTDIR/$NAME.sha256"
+(cd "$OUTDIR" && sha256sum "$NAME" | tee "$NAME.sha256")
+for d in "${LISTOS[@]}"; do cat "$d/romcheck.txt"; done | tee "$OUTDIR/compatibilidad.txt"
