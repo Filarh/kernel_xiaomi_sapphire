@@ -6,7 +6,7 @@ import sys
 
 def insert_after(path, anchor, text):
     src = open(path).read()
-    if text.strip().splitlines()[0] in src:
+    if text in src:
         return
     if src.count(anchor) != 1:
         sys.exit(f"{path}: el ancla aparece {src.count(anchor)} veces")
