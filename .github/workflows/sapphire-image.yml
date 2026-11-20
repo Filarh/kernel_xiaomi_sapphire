@@ -1,4 +1,4 @@
-name: sapphire Image (base vs BakaSU+susfs)
+name: sapphire BakaSU+susfs (Image + AnyKernel3)
 on:
   push:
     branches: ['ci/**']
@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, bakasu]
+        variant: [bakasu]
     steps:
       - name: Liberar disco
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
@@ -18,9 +18,11 @@ jobs:
         with:
           fetch-depth: 1
       - name: Dependencias
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio lz4 dwarves python3
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio lz4 dwarves python3 zip gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - name: Compilar
         run: ci/build.sh ${{ matrix.variant }}
+      - name: Empaquetar AnyKernel3
+        run: ci/package.sh ${{ matrix.variant }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
